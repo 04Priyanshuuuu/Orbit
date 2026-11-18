@@ -20,11 +20,11 @@ The first `npm install` needs internet to download dependencies and Electron. On
 ## Features
 - Transparent floating glass progress circle with adjustable size, opacity and ring
 - Hover tilts and highlights the glass progress circle; click it to open or close the adjacent task panel
-- The task panel includes My Day and custom-list tabs, inline task entry and completion, fixed daily/weekly/monthly progress rings, and active habit streaks
+- The task panel includes My Day and custom-list tabs, inline task entry with optional start/end times, task completion, fixed daily/weekly/monthly progress rings, and active habit streaks
 - The focus timer remains available in the dashboard and settings, but is not shown in the widget panel
 - Drag widget; position is saved and restored when enabled
 - `Ctrl + Alt + Space` hides/shows widget
-- Daily recurring tasks, custom lists, optional task times (including entries such as `Study DSA 7pm`)
+- Daily recurring tasks, custom lists, widget task time ranges, and optional single task times in the dashboard (including entries such as `Study DSA 7pm`)
 - Shared focus countdown timer with presets, custom duration, pause/resume and completion notification
 - Monthly activity overview
 - Settings for widget behavior, Windows startup, and timer defaults

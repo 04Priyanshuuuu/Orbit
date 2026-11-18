@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { CalendarDays, Clock3, LayoutList, Plus, Settings2, Target } from 'lucide-react';
-import { parseTaskInput } from '../taskInput';
+import { CalendarDays, Clock3, LayoutList, Plus, Settings2, Target, Trash2 } from 'lucide-react';
+import { calculateListDayProgress, calculateProductivityAnalytics } from '../analytics';
+import { formatRecurrence, formatTimeRange, isTaskScheduledForDate, parseTaskInput } from '../taskInput';
 
 type Tab = 'today' | 'lists' | 'focus' | 'analytics' | 'settings';
 const dateKey = () => {
@@ -15,15 +16,21 @@ export function Dashboard() {
   const [timer, setTimer] = useState<OrbitTimer | null>(null);
   const [tab, setTab] = useState<Tab>('today');
   const [listId, setListId] = useState('daily');
+  const [creatingList, setCreatingList] = useState(false);
+  const [newListName, setNewListName] = useState('');
   const [title, setTitle] = useState('');
-  const [time, setTime] = useState('');
-  const [daily, setDaily] = useState(true);
+  const [startTime, setStartTime] = useState('');
+  const [endTime, setEndTime] = useState('');
+  const [recurrence, setRecurrence] = useState<TaskRecurrence>({ type: 'once', date: dateKey() });
   const [error, setError] = useState('');
   const [customMinutes, setCustomMinutes] = useState('');
 
   const refresh = () => window.orbit.getData().then(next => {
     setData(next);
     setTimer(next.timer);
+    if (!next.lists.some(list => list.id === listId)) {
+      setListId('daily');
+    }
   }).catch(reason => setError(reason instanceof Error ? reason.message : 'Unable to load Orbit data.'));
 
   useEffect(() => {
@@ -36,43 +43,79 @@ export function Dashboard() {
     };
   }, []);
 
+  const now = new Date();
   const today = dateKey();
   const tasksToday = useMemo(
-    () => data?.tasks.filter(task => task.daily || task.date === today || (!task.daily && !task.date)) ?? [],
+    () => data?.tasks.filter(task =>
+      task.listId === 'daily' && isTaskScheduledForDate(task, today)
+    ) ?? [],
     [data, today]
   );
   const done = (id: string) => !!data?.completions[today]?.[id];
-  const completed = tasksToday.filter(task => done(task.id)).length;
-  const percent = tasksToday.length ? Math.round(completed / tasksToday.length * 100) : 0;
 
   async function addTask(event: FormEvent) {
     event.preventDefault();
     if (!data || !title.trim()) return;
     const parsed = parseTaskInput(title);
     if (!parsed.title) return;
+    if ((startTime && !endTime) || (!startTime && endTime)) {
+      setError('Both a start time and end time are required.');
+      return;
+    }
+    if (recurrence.type === 'weekly' && !recurrence.days.length) {
+      setError('Select at least one weekday for a custom recurrence.');
+      return;
+    }
     setError('');
     try {
+      const normalizedRecurrence: TaskRecurrence =
+        recurrence.type === 'once'
+          ? { type: 'once', date: dateKey() }
+          : recurrence;
       await window.orbit.addTask({
         title: parsed.title,
-        time: time || parsed.time || undefined,
-        daily,
+        time: parsed.time || undefined,
+        startTime: startTime || undefined,
+        endTime: endTime || undefined,
+        daily: normalizedRecurrence.type === 'daily',
+        recurrence: normalizedRecurrence,
         listId: tab === 'today' ? 'daily' : listId
       });
       setTitle('');
-      setTime('');
+      setStartTime('');
+      setEndTime('');
+      setRecurrence({ type: 'once', date: dateKey() });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Unable to add this task.');
     }
   }
 
-  async function addList() {
-    const name = prompt('Name your new list:');
-    if (!name?.trim()) return;
+  async function submitNewList(event: FormEvent) {
+    event.preventDefault();
+    const clean = newListName.trim();
+    if (!clean) {
+      setError('A list name is required.');
+      return;
+    }
+    setError('');
     try {
-      const list = await window.orbit.addList(name);
+      const list = await window.orbit.addList(clean);
       setListId(list.id);
+      setNewListName('');
+      setCreatingList(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Unable to create this list.');
+    }
+  }
+
+  async function deleteSelectedList() {
+    if (listId === 'daily') return;
+    setError('');
+    try {
+      await window.orbit.removeList(listId);
+      setListId('daily');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to delete this list.');
     }
   }
 
@@ -119,15 +162,23 @@ export function Dashboard() {
 
   if (!data) return <div className="loading">{error || 'Loading Orbit…'}</div>;
 
+  const overallAnalytics = calculateProductivityAnalytics(data, now, null);
+  const selectedListToday = calculateListDayProgress(data, now, listId);
+  const overallTodayCompleted = overallAnalytics.daily.completed;
+  const overallTodayTotal = overallAnalytics.daily.total;
+  const overallTodayPercent = overallAnalytics.daily.percent;
+
   const listTasks = data.tasks.filter(task => task.listId === listId);
   const visibleTasks = tab === 'lists' ? listTasks : tasksToday;
   const monthPrefix = today.slice(0, 7);
   const monthDays = Array.from({ length: new Date(Number(today.slice(0, 4)), Number(today.slice(5, 7)), 0).getDate() }, (_, i) => i + 1);
-  const monthHistory = Object.entries(data.history).filter(([key]) => key.startsWith(monthPrefix));
-  const activeDays = monthHistory.filter(([, day]) => day.completedTasks > 0).length;
-  const monthTasks = monthHistory.reduce((sum, [, day]) => sum + day.totalTasks, 0);
-  const monthDone = monthHistory.reduce((sum, [, day]) => sum + day.completedTasks, 0);
-  const monthPercent = monthTasks ? Math.round(monthDone / monthTasks * 100) : 0;
+  const activeDays = monthDays.filter(day => {
+    const key = `${monthPrefix}-${String(day).padStart(2, '0')}`;
+    const dayCompletions = data.completions[key] ?? {};
+    return data.tasks.some(task => dayCompletions[task.id] === true);
+  }).length;
+  const monthDone = overallAnalytics.monthly.completed;
+  const monthPercent = overallAnalytics.monthly.percent;
 
   const navigation = [
     { id: 'today' as const, label: 'Today', icon: CalendarDays },
@@ -161,19 +212,65 @@ export function Dashboard() {
       {error && <div className="inline-error" role="alert">{error}</div>}
       {tab === 'today' && <>
         <div className="summary-grid">
-          <article className="surface"><label>DAILY COMPLETION</label><strong className="big-number">{percent}%</strong><p>{completed} completed out of {tasksToday.length} tasks</p><div className="progress-track"><i style={{ width: `${percent}%` }} /></div></article>
-          <article className="surface"><label>REMAINING TASKS</label><strong className="big-number">{tasksToday.length - completed}</strong><p>One step at a time. Keep going.</p></article>
+          <article className="surface"><label>OVERALL COMPLETION (ALL LISTS)</label><strong className="big-number">{overallTodayPercent}%</strong><p>{overallTodayCompleted} completed out of {overallTodayTotal} tasks across all lists</p><div className="progress-track"><i style={{ width: `${overallTodayPercent}%` }} /></div></article>
+          <article className="surface"><label>REMAINING TASKS (ALL LISTS)</label><strong className="big-number">{Math.max(0, overallTodayTotal - overallTodayCompleted)}</strong><p>One step at a time. Keep going.</p></article>
         </div>
         <section className="section">
-          <div className="section-title"><h2>Today's schedule</h2><span>{tasksToday.length} tasks</span></div>
-          <TaskForm {...{ title, setTitle, time, setTime, daily, setDaily, addTask }} />
+          <div className="section-title"><h2>Today's schedule (My Day)</h2><span>{tasksToday.length} tasks</span></div>
+          <TaskForm {...{ title, setTitle, startTime, setStartTime, endTime, setEndTime, recurrence, setRecurrence, addTask }} />
           <TaskRows tasks={visibleTasks} done={done} toggle={id => { void runAction(window.orbit.toggleTask(id)); }} remove={id => { void runAction(window.orbit.removeTask(id)); }} />
         </section>
       </>}
       {tab === 'lists' && <section className="surface list-surface">
-        <div className="section-title"><h2>Your lists</h2><button className="secondary" onClick={() => { void addList(); }}><Plus size={14} /> New list</button></div>
-        <div className="list-tabs">{data.lists.map(list => <button className={list.id === listId ? 'selected' : ''} key={list.id} onClick={() => setListId(list.id)}>{list.name}</button>)}</div>
-        <TaskForm {...{ title, setTitle, time, setTime, daily, setDaily, addTask }} />
+        <div className="section-title">
+          <h2>Your lists · {selectedListToday.percent}% today ({selectedListToday.completed}/{selectedListToday.total})</h2>
+          <div className="list-header-actions">
+            {creatingList ? (
+              <form className="dashboard-new-list-form" onSubmit={submitNewList}>
+                <input
+                  autoFocus
+                  value={newListName}
+                  onChange={event => setNewListName(event.target.value)}
+                  placeholder="List name..."
+                  maxLength={40}
+                  onKeyDown={event => {
+                    if (event.key === 'Escape') {
+                      setCreatingList(false);
+                      setNewListName('');
+                    }
+                  }}
+                />
+                <button type="submit" className="primary">Save</button>
+                <button type="button" className="secondary" onClick={() => { setCreatingList(false); setNewListName(''); }}>Cancel</button>
+              </form>
+            ) : (
+              <>
+                <button className="secondary" onClick={() => { setError(''); setCreatingList(true); }}><Plus size={14} /> New list</button>
+                {listId !== 'daily' && (
+                  <button className="danger-button" onClick={() => { void deleteSelectedList(); }} title="Delete selected list">
+                    <Trash2 size={14} /> Delete list
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+        <div className="list-tabs">{data.lists.map(list => (
+          <button
+            className={list.id === listId ? 'selected' : ''}
+            key={list.id}
+            onClick={() => setListId(list.id)}
+            onDoubleClick={() => {
+              if (list.id === 'daily') return;
+              const nextName = window.prompt('Rename list:', list.name);
+              if (nextName && nextName.trim() && nextName.trim() !== list.name) {
+                void runAction(window.orbit.renameList(list.id, nextName.trim()));
+              }
+            }}
+            title={list.id === 'daily' ? list.name : `${list.name} (double-click to rename)`}
+          >{list.name}</button>
+        ))}</div>
+        <TaskForm {...{ title, setTitle, startTime, setStartTime, endTime, setEndTime, recurrence, setRecurrence, addTask }} />
         <TaskRows tasks={visibleTasks} done={done} toggle={id => { void runAction(window.orbit.toggleTask(id)); }} remove={id => { void runAction(window.orbit.removeTask(id)); }} />
       </section>}
       {tab === 'focus' && timer && <section className="surface timer-card">
@@ -190,18 +287,19 @@ export function Dashboard() {
       </section>}
       {tab === 'analytics' && <>
         <div className="summary-grid three">
-          <article className="surface"><label>THIS MONTH'S COMPLETION</label><strong className="big-number">{monthPercent}%</strong></article>
-          <article className="surface"><label>RECORDED COMPLETIONS</label><strong className="big-number">{monthDone}</strong></article>
+          <article className="surface"><label>OVERALL MONTHLY COMPLETION (ALL LISTS)</label><strong className="big-number">{monthPercent}%</strong></article>
+          <article className="surface"><label>RECORDED COMPLETIONS (ALL LISTS)</label><strong className="big-number">{monthDone}</strong></article>
           <article className="surface"><label>ACTIVE DAYS</label><strong className="big-number">{activeDays}</strong></article>
         </div>
         <section className="surface analytics">
-          <h2>{new Date().toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}</h2>
+          <h2>{new Date().toLocaleDateString(undefined, { month: 'long', year: 'numeric' })} · Overall activity</h2>
           <div className="heatmap">{monthDays.map(day => {
             const key = `${monthPrefix}-${String(day).padStart(2, '0')}`;
-            const count = data.history[key]?.completedTasks ?? 0;
-            return <div key={day} title={`${key}: ${count} completed`} className={`heat ${count >= 4 ? 'high' : count ? 'low' : ''}`}>{day}</div>;
+            const dayCompletions = data.completions[key] ?? {};
+            const count = data.tasks.filter(task => dayCompletions[task.id] === true).length;
+            return <div key={day} title={`${key}: ${count} completed across all lists`} className={`heat ${count >= 4 ? 'high' : count ? 'low' : ''}`}>{day}</div>;
           })}</div>
-          <p>Daily completion snapshots and activity are stored locally.</p>
+          <p>Combined completion across My Day and all custom lists is stored locally.</p>
         </section>
       </>}
       {tab === 'settings' && <SettingsPage
@@ -218,16 +316,64 @@ export function Dashboard() {
 function TaskForm(props: {
   title: string;
   setTitle: (value: string) => void;
-  time: string;
-  setTime: (value: string) => void;
-  daily: boolean;
-  setDaily: (value: boolean) => void;
+  startTime: string;
+  setStartTime: (value: string) => void;
+  endTime: string;
+  setEndTime: (value: string) => void;
+  recurrence: TaskRecurrence;
+  setRecurrence: (value: TaskRecurrence) => void;
   addTask: (event: FormEvent) => void;
 }) {
+  const timeOptions = Array.from({ length: 48 }, (_, index) => {
+    const hours = Math.floor(index / 2);
+    const minutes = index % 2 ? '30' : '00';
+    const value = `${String(hours).padStart(2, '0')}:${minutes}`;
+    const hour12 = hours % 12 || 12;
+    return { value, label: `${hour12}:${minutes}${hours < 12 ? 'am' : 'pm'}` };
+  });
+  const recurrence = props.recurrence;
+  const recurrenceMode = recurrence.type === 'once'
+    ? 'once'
+    : recurrence.type === 'daily'
+      ? 'daily'
+      : recurrence.days.length === 5 && [1, 2, 3, 4, 5].every(day => recurrence.days.includes(day))
+        ? 'weekdays'
+        : recurrence.days.length === 2 && [0, 6].every(day => recurrence.days.includes(day))
+          ? 'weekends'
+          : 'custom';
+  const setMode = (mode: string) => {
+    if (mode === 'once') props.setRecurrence({ type: 'once', date: dateKey() });
+    if (mode === 'daily') props.setRecurrence({ type: 'daily' });
+    if (mode === 'weekdays') props.setRecurrence({ type: 'weekly', days: [1, 2, 3, 4, 5] });
+    if (mode === 'weekends') props.setRecurrence({ type: 'weekly', days: [0, 6] });
+    if (mode === 'custom') props.setRecurrence({ type: 'weekly', days: recurrence.type === 'weekly' ? recurrence.days : [] });
+  };
   return <form className="task-form" onSubmit={props.addTask}>
     <input value={props.title} onChange={event => props.setTitle(event.target.value)} placeholder="Add a task... Try 'Study DSA 7pm'" maxLength={100} required />
-    <input type="time" value={props.time} onChange={event => props.setTime(event.target.value)} aria-label="Optional task time" />
-    <label><input type="checkbox" checked={props.daily} onChange={event => props.setDaily(event.target.checked)} /> Daily</label>
+    <select value={props.startTime} onChange={event => props.setStartTime(event.target.value)} aria-label="Optional start time">
+      <option value="">Start</option>{timeOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+    </select>
+    <select value={props.endTime} onChange={event => props.setEndTime(event.target.value)} aria-label="Optional end time">
+      <option value="">End</option>{timeOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+    </select>
+    <select value={recurrenceMode} onChange={event => setMode(event.target.value)} aria-label="Task recurrence">
+      <option value="once">Only today</option>
+      <option value="daily">Daily</option>
+      <option value="weekdays">Weekdays</option>
+      <option value="weekends">Weekends</option>
+      <option value="custom">Custom</option>
+    </select>
+    {recurrence.type === 'weekly' && <div className="dashboard-weekdays">
+      {[1, 2, 3, 4, 5, 6, 0].map(day => <label key={day}>
+        <input type="checkbox" checked={recurrence.days.includes(day)} onChange={event => {
+          const days = event.target.checked
+            ? [...recurrence.days, day]
+            : recurrence.days.filter((value: number) => value !== day);
+          props.setRecurrence({ type: 'weekly', days });
+        }} />
+        {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][day]}
+      </label>)}
+    </div>}
     <button className="primary"><Plus size={15} /> Add task</button>
   </form>;
 }
@@ -242,7 +388,9 @@ function TaskRows({ tasks, done, toggle, remove }: {
   return <div className="task-rows">{tasks.map(task => <div className="task-row" key={task.id}>
     <input type="checkbox" checked={done(task.id)} aria-label={`Complete ${task.title}`} onChange={() => toggle(task.id)} />
     <span className={done(task.id) ? 'completed' : ''}>{task.title}</span>
-    <small>{task.time || ''} {task.daily ? '· Daily' : ''}</small>
+    <small>{task.startTime && task.endTime
+      ? formatTimeRange(task.startTime, task.endTime)
+      : task.time ? formatTaskTime(task.time) : ''}{task.recurrence ? ` · ${formatRecurrence(task.recurrence)}` : ''}</small>
     <button title="Delete task" aria-label={`Delete ${task.title}`} onClick={() => remove(task.id)}>×</button>
   </div>)}</div>;
 }

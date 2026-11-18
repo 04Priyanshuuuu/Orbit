@@ -1,139 +1,137 @@
-type Progress = { completed: number; total: number; percent: number };
-
-export type ProductivityAnalytics = {
-  daily: Progress;
-  weekly: Progress;
-  monthly: Progress;
-  currentStreak: number;
-  bestStreak: number;
-  activeStreaks: { taskId: string; title: string; days: number }[];
-  monthlyConsistency: number;
-  activeDaysThisMonth: number;
-  daysElapsedThisMonth: number;
-};
+import { isTaskScheduledForDate } from './taskInput';
 
 const dateKey = (date: Date) =>
   `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 
-const daysBetween = (start: Date, end: Date) =>
-  Math.round((Date.UTC(end.getFullYear(), end.getMonth(), end.getDate()) -
-    Date.UTC(start.getFullYear(), start.getMonth(), start.getDate())) / 86_400_000);
+const addDays = (date: Date, days: number) => {
+  const next = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  next.setDate(next.getDate() + days);
+  return next;
+};
 
-function progress(completed: number, total: number): Progress {
+const parseDateKey = (value: string) => {
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(year, month - 1, day);
+};
+
+export type PeriodProgress = {
+  completed: number;
+  total: number;
+  percent: number;
+};
+
+export type TaskStreak = {
+  taskId: string;
+  title: string;
+  days: number;
+};
+
+export type ProductivityAnalytics = {
+  daily: PeriodProgress;
+  weekly: PeriodProgress;
+  monthly: PeriodProgress;
+  activeStreaks: TaskStreak[];
+};
+
+function getScheduledTasksForList(tasks: OrbitTask[], key: string, listId: string | null): OrbitTask[] {
+  const createdCutoff = key;
+  const filtered = tasks.filter(task => {
+    if (listId !== null && task.listId !== listId) return false;
+    const createdKey = typeof task.createdAt === 'string' ? task.createdAt.slice(0, 10) : '';
+    if (createdKey && createdKey > createdCutoff) return false;
+    return isTaskScheduledForDate(task, key);
+  });
+  return [...new Map(filtered.map(task => [task.id, task])).values()];
+}
+
+function calculateDayTotals(data: OrbitData, key: string, listId: string | null): { completed: number; total: number } {
+  const scheduled = getScheduledTasksForList(data.tasks, key, listId);
+  const completed = scheduled.filter(task => data.completions[key]?.[task.id] === true).length;
+  return { completed, total: scheduled.length };
+}
+
+function summarizeDates(data: OrbitData, dates: Date[], listId: string | null): PeriodProgress {
+  let completed = 0;
+  let total = 0;
+  for (const date of dates) {
+    const day = calculateDayTotals(data, dateKey(date), listId);
+    completed += day.completed;
+    total += day.total;
+  }
   return {
     completed,
     total,
-    percent: total ? Math.min(100, Math.round(completed / total * 100)) : 0
+    percent: total ? Math.round(completed / total * 100) : 0
   };
 }
 
-export function calculateProductivityAnalytics(
-  data: Pick<OrbitData, 'tasks' | 'completions' | 'history'>,
-  now = new Date()
-): ProductivityAnalytics {
-  const todayKey = dateKey(now);
-  const todayTasks = [...new Map(data.tasks
-    .filter(task => task.daily || task.date === todayKey || (!task.daily && !task.date))
-    .map(task => [task.id, task])).values()];
-  const todayCompletions = data.completions[todayKey] ?? {};
-  const daily = progress(
-    todayTasks.filter(task => todayCompletions[task.id] === true).length,
-    todayTasks.length
-  );
+function calculateTaskStreak(task: OrbitTask, completions: OrbitData['completions'], today: Date): number {
+  const todayKey = dateKey(today);
+  const createdKey = typeof task.createdAt === 'string' ? task.createdAt.slice(0, 10) : '';
+  let cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  let streak = 0;
 
-  const dayProgress = (key: string) => {
-    if (key === todayKey) return daily;
-    const snapshot = data.history[key];
-    if (snapshot) {
-      if (snapshot.taskIds) {
-        const completed = snapshot.taskIds.filter(id => data.completions[key]?.[id] === true).length;
-        return progress(completed, snapshot.taskIds.length);
-      }
-      return progress(snapshot.completedTasks, snapshot.totalTasks);
+  for (let checked = 0; checked < 366; checked++) {
+    const key = dateKey(cursor);
+    if (createdKey && key < createdKey) break;
+    if (!isTaskScheduledForDate(task, key)) {
+      cursor = addDays(cursor, -1);
+      continue;
     }
-    return progress(0, 0);
-  };
-
-  const sumPeriod = (keys: string[]) => {
-    const totals = keys.reduce((sum, key) => {
-      const day = dayProgress(key);
-      return { completed: sum.completed + day.completed, total: sum.total + day.total };
-    }, { completed: 0, total: 0 });
-    return progress(totals.completed, totals.total);
-  };
-
-  const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const daysSinceMonday = (now.getDay() + 6) % 7;
-  weekStart.setDate(weekStart.getDate() - daysSinceMonday);
-  const weekKeys = Array.from({ length: daysSinceMonday + 1 }, (_, index) => {
-    const date = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + index);
-    return dateKey(date);
-  });
-  const monthKeys = Array.from({ length: now.getDate() }, (_, index) =>
-    dateKey(new Date(now.getFullYear(), now.getMonth(), index + 1))
-  );
-
-  const activeKeys = new Set([
-    ...Object.keys(data.history).filter(key => data.history[key].completedTasks > 0),
-    ...Object.keys(data.completions).filter(key =>
-      Object.values(data.completions[key] ?? {}).some(Boolean)
-    )
-  ]);
-  const isActive = (key: string) => activeKeys.has(key);
-
-  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-  let streakEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  if (!isActive(todayKey)) {
-    if (!isActive(dateKey(yesterday))) streakEnd = new Date(NaN);
-    else streakEnd = yesterday;
-  }
-  let currentStreak = 0;
-  while (Number.isFinite(streakEnd.getTime()) && isActive(dateKey(streakEnd))) {
-    currentStreak += 1;
-    streakEnd.setDate(streakEnd.getDate() - 1);
+    if (completions[key]?.[task.id] === true) {
+      streak++;
+      cursor = addDays(cursor, -1);
+      continue;
+    }
+    if (key === todayKey) {
+      cursor = addDays(cursor, -1);
+      continue;
+    }
+    break;
   }
 
-  let bestStreak = 0;
-  let run = 0;
-  const sortedActiveDates = [...activeKeys].filter(key => /^\d{4}-\d{2}-\d{2}$/.test(key)).sort();
-  let previousDate: Date | null = null;
-  for (const key of sortedActiveDates) {
-    const currentDate = new Date(`${key}T00:00:00`);
-    run = previousDate && daysBetween(previousDate, currentDate) === 1 ? run + 1 : 1;
-    bestStreak = Math.max(bestStreak, run);
-    previousDate = currentDate;
-  }
-
-  const activeDaysThisMonth = monthKeys.filter(isActive).length;
-  const activeStreaks = [...new Map(data.tasks.filter(task => task.daily)
-    .map(task => [task.id, task])).values()]
-    .map(task => {
-      const completedDates = new Set(Object.keys(data.completions).filter(key =>
-        data.completions[key]?.[task.id] === true
-      ));
-      let end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      if (!completedDates.has(dateKey(end))) {
-        end.setDate(end.getDate() - 1);
-      }
-      let days = 0;
-      while (completedDates.has(dateKey(end))) {
-        days += 1;
-        end.setDate(end.getDate() - 1);
-      }
-      return { taskId: task.id, title: task.title, days };
-    })
-    .filter(streak => streak.days > 0)
-    .sort((a, b) => b.days - a.days);
-
-  return {
-    daily,
-    weekly: sumPeriod(weekKeys),
-    monthly: sumPeriod(monthKeys),
-    currentStreak,
-    bestStreak,
-    activeStreaks,
-    monthlyConsistency: Math.round(activeDaysThisMonth / now.getDate() * 100),
-    activeDaysThisMonth,
-    daysElapsedThisMonth: now.getDate()
-  };
+  return streak;
 }
+
+export function calculateListDayProgress(data: OrbitData, date: Date, listId: string | null): PeriodProgress {
+  return summarizeDates(data, [date], listId);
+}
+
+/**
+ * listId:
+ * - string (e.g. 'daily' or custom list id) => calculates progress only for that list
+ * - null => calculates overall combined progress across ALL lists
+ */
+export function calculateProductivityAnalytics(
+  data: OrbitData,
+  now = new Date(),
+  listId: string | null = 'daily'
+): ProductivityAnalytics {
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const daily = summarizeDates(data, [today], listId);
+
+  const weekOffset = (today.getDay() + 6) % 7;
+  const weekStart = addDays(today, -weekOffset);
+  const weekDates = Array.from({ length: weekOffset + 1 }, (_, index) => addDays(weekStart, index));
+  const weekly = summarizeDates(data, weekDates, listId);
+
+  const monthDates = Array.from(
+    { length: today.getDate() },
+    (_, index) => new Date(today.getFullYear(), today.getMonth(), index + 1)
+  );
+  const monthly = summarizeDates(data, monthDates, listId);
+
+  const activeStreaks = data.tasks
+    .filter(task => (listId === null || task.listId === listId) && task.recurrence?.type !== 'once')
+    .map(task => ({
+      taskId: task.id,
+      title: task.title,
+      days: calculateTaskStreak(task, data.completions, today)
+    }))
+    .filter(streak => streak.days > 0)
+    .sort((left, right) => right.days - left.days || left.title.localeCompare(right.title));
+
+  return { daily, weekly, monthly, activeStreaks };
+}
+
+export { parseDateKey };

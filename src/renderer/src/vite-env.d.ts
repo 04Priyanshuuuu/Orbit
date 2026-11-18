@@ -2,16 +2,31 @@
 
 declare global {
   type OrbitList = { id: string; name: string };
+  type TaskRecurrence =
+    | { type: 'once'; date: string }
+    | { type: 'daily' }
+    | { type: 'weekly'; days: number[] };
   type OrbitTask = {
     id: string;
     listId: string;
     title: string;
     time?: string;
+    startTime?: string;
+    endTime?: string;
     daily: boolean;
     date?: string;
     createdAt: string;
+    recurrence?: TaskRecurrence;
   };
-  type OrbitTaskDraft = { title: string; time?: string; daily: boolean; listId?: string };
+  type OrbitTaskDraft = {
+    title: string;
+    time?: string;
+    startTime?: string;
+    endTime?: string;
+    daily: boolean;
+    listId?: string;
+    recurrence?: TaskRecurrence;
+  };
   type OrbitSettings = {
     widgetX: number;
     widgetY: number;
@@ -61,6 +76,8 @@ declare global {
       toggleTask: (id: string) => Promise<void>;
       removeTask: (id: string) => Promise<void>;
       addList: (name: string) => Promise<OrbitList>;
+      renameList: (id: string, name: string) => Promise<OrbitList>;
+      removeList: (id: string) => Promise<void>;
       updateSettings: (patch: Partial<OrbitSettings>) => Promise<OrbitSettings>;
       resetPosition: () => Promise<boolean>;
       resetSettings: () => Promise<OrbitSettings>;
@@ -75,6 +92,7 @@ declare global {
       beginWidgetDrag: (point: { x: number; y: number }) => void;
       moveWidgetDrag: (point: { x: number; y: number }) => void;
       endWidgetDrag: () => void;
+      setWidgetTransientInteraction: (active: boolean) => void;
       onWidgetData: (callback: (data: WidgetData) => void) => () => void;
       onTimerData: (callback: (timer: OrbitTimer) => void) => () => void;
       onDataChanged: (callback: () => void) => () => void;

@@ -2,8 +2,25 @@ import { app, BrowserWindow, globalShortcut, ipcMain, Notification, screen } fro
 import { join } from 'node:path';
 import fs from 'node:fs';
 
-type TaskDraft = { title: string; time?: string; daily: boolean; listId?: string };
+
+app.setName('Orbit');
+
+
+type TaskDraft = {
+  title: string;
+  time?: string;
+  startTime?: string;
+  endTime?: string;
+  daily: boolean;
+  listId?: string;
+  recurrence?: TaskRecurrence;
+};
 type SettingsPatch = Partial<OrbitData['settings']>;
+
+const isValidClockTime = (value: string) => {
+  const match = value.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+};
 
 const defaultSettings: OrbitData['settings'] = {
   widgetX: 100,
@@ -45,6 +62,7 @@ let storedData: OrbitData;
 let dragStart: { cursorX: number; cursorY: number; windowX: number; windowY: number } | null = null;
 let timerInterval: NodeJS.Timeout | null = null;
 let timerFinishedOnStartup = false;
+let transientInteractionActive = false;
 
 const filePath = () => join(app.getPath('userData'), 'orbit-data.json');
 const backupPath = () => `${filePath()}.bak`;
@@ -60,6 +78,23 @@ const dateKey = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
+
+function isValidDateKey(value: unknown): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function isTaskScheduledForDate(task: OrbitTask, date: string): boolean {
+  if (!isValidDateKey(date)) return false;
+  if (task.recurrence?.type === 'once') return task.recurrence.date === date;
+  if (task.recurrence?.type === 'daily') return true;
+  if (task.recurrence?.type === 'weekly') {
+    const [year, month, day] = date.split('-').map(Number);
+    return task.recurrence.days.includes(new Date(year, month - 1, day).getDay());
+  }
+  if (task.daily) return true;
+  if (task.date) return task.date === date;
+  return isValidDateKey(task.createdAt?.slice(0, 10)) && task.createdAt.slice(0, 10) === date;
+}
 
 function normalizeData(value: unknown): OrbitData {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -114,7 +149,34 @@ function normalizeData(value: unknown): OrbitData {
       }
     : { durationSeconds, remainingSeconds: durationSeconds, endAt: null, running: false };
 
-  const tasks = input.tasks ?? [];
+  const tasks: OrbitTask[] = (input.tasks ?? []).map((raw, index) => {
+    if (!raw || typeof raw !== 'object') throw new Error(`Orbit task ${index + 1} is invalid.`);
+    const task = raw as OrbitTask & { recurrence?: TaskRecurrence };
+    let recurrence: TaskRecurrence | undefined;
+    if (task.recurrence?.type === 'once' && isValidDateKey(task.recurrence.date)) {
+      recurrence = { type: 'once', date: task.recurrence.date };
+    } else if (task.recurrence?.type === 'daily') {
+      recurrence = { type: 'daily' };
+    } else if (task.recurrence?.type === 'weekly' && Array.isArray(task.recurrence.days)) {
+      const days = [...new Set(task.recurrence.days.filter(day =>
+        Number.isInteger(day) && day >= 0 && day <= 6
+      ))];
+      if (days.length) recurrence = { type: 'weekly', days };
+    }
+    if (!recurrence) {
+      if (task.daily === true) recurrence = { type: 'daily' };
+      else if (isValidDateKey(task.date)) recurrence = { type: 'once', date: task.date };
+      else if (isValidDateKey(task.createdAt?.slice(0, 10))) {
+        recurrence = { type: 'once', date: task.createdAt.slice(0, 10) };
+      } else recurrence = { type: 'once', date: dateKey() };
+    }
+    return {
+      ...task,
+      recurrence,
+      daily: recurrence.type === 'daily',
+      date: recurrence.type === 'once' ? recurrence.date : task.date
+    };
+  });
   const completions = input.completions && typeof input.completions === 'object' ? input.completions : {};
   const history: OrbitData['history'] = {};
   for (const [key, record] of Object.entries(input.history ?? {})) {
@@ -133,7 +195,7 @@ function normalizeData(value: unknown): OrbitData {
   }
   for (const [key, day] of Object.entries(completions)) {
     if (history[key]) continue;
-    const dayTasks = tasks.filter(task => task.daily || task.date === key || (!task.daily && !task.date));
+    const dayTasks = tasks.filter(task => task.listId === 'daily' && isTaskScheduledForDate(task, key));
     const completedTasks = Object.values(day ?? {}).filter(Boolean).length;
     const totalTasks = Math.max(dayTasks.length, completedTasks);
     history[key] = {
@@ -142,8 +204,15 @@ function normalizeData(value: unknown): OrbitData {
       percentage: totalTasks ? Math.round(completedTasks / totalTasks * 100) : 0
     };
   }
+  const normalizedLists = (input.lists ?? structuredClone(initialData.lists)).filter(
+    (list): list is { id: string; name: string } =>
+      Boolean(list && typeof list.id === 'string' && typeof list.name === 'string' && list.name.trim())
+  );
+  if (!normalizedLists.some(list => list.id === 'daily')) {
+    normalizedLists.unshift({ id: 'daily', name: 'Daily' });
+  }
   return {
-    lists: input.lists ?? structuredClone(initialData.lists),
+    lists: normalizedLists,
     tasks,
     completions,
     history,
@@ -205,14 +274,13 @@ function loadData() {
 }
 
 function getTodayTasks(data = storedData) {
-  const tasks = data.tasks.filter(task => task.daily || task.date === dateKey() || (!task.daily && !task.date));
+  const key = dateKey();
+  const tasks = data.tasks.filter(task => task.listId === 'daily' && isTaskScheduledForDate(task, key));
   return [...new Map(tasks.map(task => [task.id, task])).values()];
 }
 
 function updateDailyHistory(key: string) {
-  const tasks = storedData.tasks.filter(task =>
-    task.daily || task.date === key || (!task.daily && !task.date)
-  );
+  const tasks = storedData.tasks.filter(task => task.listId === 'daily' && isTaskScheduledForDate(task, key));
   const taskIds = [...new Set(tasks.map(task => task.id))];
   const completedTasks = taskIds.filter(id => storedData.completions[key]?.[id] === true).length;
   const totalTasks = taskIds.length;
@@ -437,7 +505,7 @@ function createWidget() {
   logWindowDiagnostics('Widget', widget, true);
   loadRenderer(widget, 'widget');
   widget.on('blur', () => {
-    setTimeout(collapseWidgetOnBlur, 80);
+    setTimeout(collapseWidgetOnBlur, 120);
   });
   widget.on('closed', () => {
     persistPosition();
@@ -537,6 +605,7 @@ function applyWidgetCollapse(event: Electron.IpcMainEvent) {
   if (expanded && pendingCollapsedBounds) {
     widget.setBounds(pendingCollapsedBounds, true);
     expanded = false;
+    transientInteractionActive = false;
     persistPosition();
   }
   pendingCollapsedBounds = null;
@@ -546,6 +615,7 @@ function applyWidgetCollapse(event: Electron.IpcMainEvent) {
 
 function collapseWidgetOnBlur() {
   if (!widget || widget.isDestroyed() || !expanded || widget.isFocused()) return;
+  if (transientInteractionActive) return;
   pendingCollapsedBounds = null;
   const circleX = widget.getBounds().x + expandedPlacement.orbX;
   const circleY = widget.getBounds().y + expandedPlacement.orbY;
@@ -553,6 +623,7 @@ function collapseWidgetOnBlur() {
   const bounds = { ...clampBounds(circleX, circleY, size, size), width: size, height: size };
   widget.setBounds(bounds, true);
   expanded = false;
+  transientInteractionActive = false;
   persistPosition();
   sendWidgetData();
 }
@@ -600,15 +671,65 @@ function registerIpc() {
     return { ...storedData, timer: currentTimer() };
   });
   ipcMain.handle('orbit:add-task', (_event, draft: TaskDraft) => {
+    if (!draft || typeof draft !== 'object') throw new Error('Task details are invalid.');
     const title = typeof draft.title === 'string' ? draft.title.trim().slice(0, 100) : '';
     if (!title) throw new Error('A task title is required.');
+    const listId = typeof draft.listId === 'string' ? draft.listId : 'daily';
+    if (!storedData.lists.some(list => list.id === listId)) throw new Error('The selected list does not exist.');
+    const hasStartTime = draft.startTime !== undefined;
+    const hasEndTime = draft.endTime !== undefined;
+    if (hasStartTime !== hasEndTime) throw new Error('Both a start time and end time are required.');
+    let startTime: string | undefined;
+    let endTime: string | undefined;
+    if (hasStartTime && hasEndTime) {
+      if (typeof draft.startTime !== 'string' || typeof draft.endTime !== 'string') {
+        throw new Error('Task times are invalid.');
+      }
+      const startMinutes = isValidClockTime(draft.startTime);
+      const endMinutes = isValidClockTime(draft.endTime);
+      if (startMinutes === null || endMinutes === null || endMinutes <= startMinutes) {
+        throw new Error('The end time must be later than a valid start time.');
+      }
+      startTime = draft.startTime;
+      endTime = draft.endTime;
+    }
+    let time: string | undefined;
+    if (draft.time !== undefined) {
+      if (typeof draft.time !== 'string' || isValidClockTime(draft.time) === null) {
+        throw new Error('Task time is invalid.');
+      }
+      time = draft.time;
+    }
+    let recurrence: TaskRecurrence;
+    if (draft.recurrence) {
+      if (draft.recurrence.type === 'once') {
+        if (!isValidDateKey(draft.recurrence.date)) throw new Error('The task date is invalid.');
+        recurrence = { type: 'once', date: draft.recurrence.date };
+      } else if (draft.recurrence.type === 'daily') {
+        recurrence = { type: 'daily' };
+      } else if (draft.recurrence.type === 'weekly') {
+        const days = [...new Set(draft.recurrence.days.filter(day =>
+          Number.isInteger(day) && day >= 0 && day <= 6
+        ))];
+        if (!days.length) throw new Error('Select at least one weekday for a custom recurrence.');
+        recurrence = { type: 'weekly', days };
+      } else {
+        throw new Error('Task recurrence is invalid.');
+      }
+    } else if (draft.daily === true) {
+      recurrence = { type: 'daily' };
+    } else {
+      recurrence = { type: 'once', date: dateKey() };
+    }
     const task: OrbitTask = {
       id: `task-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`,
-      listId: typeof draft.listId === 'string' && storedData.lists.some(list => list.id === draft.listId) ? draft.listId : 'daily',
+      listId,
       title,
-      time: typeof draft.time === 'string' && /^\d{2}:\d{2}$/.test(draft.time) ? draft.time : undefined,
-      daily: draft.daily === true,
-      date: draft.daily ? '' : dateKey(),
+      ...(time ? { time } : {}),
+      ...(startTime && endTime ? { startTime, endTime } : {}),
+      daily: recurrence.type === 'daily',
+      date: recurrence.type === 'once' ? recurrence.date : '',
+      recurrence,
       createdAt: new Date().toISOString()
     };
     storedData.tasks.push(task);
@@ -636,9 +757,8 @@ function registerIpc() {
         history.completedTasks = history.taskIds.filter(taskId => storedData.completions[key]?.[taskId] === true).length;
       } else {
         const createdKey = typeof task.createdAt === 'string' ? task.createdAt.slice(0, 10) : '';
-        const scheduled = task.daily
-          ? key >= createdKey
-          : task.date ? task.date === key : key >= createdKey;
+        const scheduled = isTaskScheduledForDate(task, key) &&
+          (!createdKey || key >= createdKey);
         if (scheduled) {
           history.totalTasks = Math.max(0, history.totalTasks - 1);
           if (storedData.completions[key]?.[id] === true) {
@@ -658,11 +778,53 @@ function registerIpc() {
   ipcMain.handle('orbit:add-list', (_event, name: string) => {
     const cleanName = typeof name === 'string' ? name.trim().slice(0, 40) : '';
     if (!cleanName) throw new Error('A list name is required.');
-    const list = { id: `list-${Date.now()}`, name: cleanName };
+    if (storedData.lists.some(list => list.name.trim().toLowerCase() === cleanName.toLowerCase())) {
+      throw new Error('A list with that name already exists.');
+    }
+    let id: string;
+    do {
+      id = `list-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
+    } while (storedData.lists.some(list => list.id === id));
+    const list = { id, name: cleanName };
     storedData.lists.push(list);
     persistData();
     broadcastDataChanged();
     return list;
+  });
+  ipcMain.handle('orbit:rename-list', (_event, id: string, name: string) => {
+    if (typeof id !== 'string' || id === 'daily') {
+      throw new Error('The default Daily list cannot be renamed.');
+    }
+    const cleanName = typeof name === 'string' ? name.trim().slice(0, 40) : '';
+    if (!cleanName) throw new Error('A list name is required.');
+    const target = storedData.lists.find(list => list.id === id);
+    if (!target) throw new Error('The selected list does not exist.');
+    if (storedData.lists.some(list => list.id !== id && list.name.trim().toLowerCase() === cleanName.toLowerCase())) {
+      throw new Error('A list with that name already exists.');
+    }
+    target.name = cleanName;
+    persistData();
+    broadcastDataChanged();
+    return target;
+  });
+  ipcMain.handle('orbit:remove-list', (_event, id: string) => {
+    if (typeof id !== 'string' || id === 'daily') {
+      throw new Error('The default Daily list cannot be deleted.');
+    }
+    if (!storedData.lists.some(list => list.id === id)) return;
+    const removedTaskIds = new Set(
+      storedData.tasks.filter(task => task.listId === id).map(task => task.id)
+    );
+    storedData.lists = storedData.lists.filter(list => list.id !== id);
+    storedData.tasks = storedData.tasks.filter(task => task.listId !== id);
+    for (const dayCompletions of Object.values(storedData.completions)) {
+      for (const taskId of removedTaskIds) {
+        delete dayCompletions[taskId];
+      }
+    }
+    updateDailyHistory(dateKey());
+    persistData();
+    broadcastDataChanged();
   });
   ipcMain.handle('orbit:update-settings', (_event, patch: SettingsPatch) => {
     if (!patch || typeof patch !== 'object') throw new Error('Settings update is invalid.');
@@ -697,6 +859,7 @@ function registerIpc() {
     storedData.settings = { ...storedData.settings, widgetX: position.x, widgetY: position.y };
     if (widget && !widget.isDestroyed()) {
       expanded = false;
+      transientInteractionActive = false;
       pendingExpandedBounds = null;
       pendingCollapsedBounds = null;
       widget.setBounds({ ...position, width: widgetSize(), height: widgetSize() });
@@ -711,6 +874,7 @@ function registerIpc() {
     storedData.timer = { durationSeconds: 25 * 60, remainingSeconds: 25 * 60, endAt: null, running: false };
     if (app.isPackaged && process.platform === 'win32') app.setLoginItemSettings({ openAtLogin: false, path: process.execPath });
     expanded = false;
+    transientInteractionActive = false;
     pendingExpandedBounds = null;
     pendingCollapsedBounds = null;
     applyWidgetSettings();
@@ -776,15 +940,15 @@ function registerIpc() {
   ipcMain.on('orbit:move-widget-drag', (event, point: { x: number; y: number }) => {
     if (!widget || event.sender !== widget.webContents || !dragStart || !Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return;
     const [width, height] = widget.getSize();
-      const cursorX = Math.round(point.x);
-      const cursorY = Math.round(point.y);
-      const proposedX = dragStart.windowX + cursorX - dragStart.cursorX;
-      const proposedY = dragStart.windowY + cursorY - dragStart.cursorY;
-      const display = screen.getDisplayNearestPoint({ x: cursorX, y: cursorY });
-      const { workArea } = display;
-      const x = Math.round(Math.max(workArea.x, Math.min(proposedX, workArea.x + workArea.width - width)));
-      const y = Math.round(Math.max(workArea.y, Math.min(proposedY, workArea.y + workArea.height - height)));
-      widget.setPosition(x, y, false);
+    const cursorX = Math.round(point.x);
+    const cursorY = Math.round(point.y);
+    const proposedX = dragStart.windowX + cursorX - dragStart.cursorX;
+    const proposedY = dragStart.windowY + cursorY - dragStart.cursorY;
+    const display = screen.getDisplayNearestPoint({ x: cursorX, y: cursorY });
+    const { workArea } = display;
+    const x = Math.round(Math.max(workArea.x, Math.min(proposedX, workArea.x + workArea.width - width)));
+    const y = Math.round(Math.max(workArea.y, Math.min(proposedY, workArea.y + workArea.height - height)));
+    widget.setPosition(x, y, false);
   });
   ipcMain.on('orbit:end-widget-drag', (event) => {
     if (widget && event.sender === widget.webContents) {
@@ -792,6 +956,10 @@ function registerIpc() {
       if (expanded) repositionExpandedWidget();
       persistPosition();
     }
+  });
+  ipcMain.on('orbit:set-widget-transient-interaction', (event, active: boolean) => {
+    if (!widget || event.sender !== widget.webContents) return;
+    transientInteractionActive = active === true;
   });
 }
 

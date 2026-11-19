@@ -1,5 +1,5 @@
 import { FormEvent, PointerEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Check, Clock3, ExternalLink, Plus } from 'lucide-react';
+import { Check, Clock3, ExternalLink, Flame, Pause, Play, Plus, RotateCcw, SlidersHorizontal, Timer } from 'lucide-react';
 import { calculateListDayProgress, calculateProductivityAnalytics } from '../analytics';
 import { formatTaskTime, formatTimeRange, formatRecurrence, isTaskScheduledForDate, isValidTimeRange } from '../taskInput';
 import { TimePicker } from './TimePicker';
@@ -20,6 +20,17 @@ function getRecurrencePreset(recurrence: TaskRecurrence, customMode: boolean): R
   return 'custom';
 }
 
+function formatClockDisplay(totalSeconds: number, forceHours = false): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const hrs = Math.floor(safe / 3600);
+  const mins = Math.floor((safe % 3600) / 60);
+  const secs = safe % 60;
+  if (hrs > 0 || forceHours) {
+    return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
 export function Widget() {
   const [data, setData] = useState<WidgetData | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -28,6 +39,14 @@ export function Widget() {
   const [newListName, setNewListName] = useState('');
   const [renamingListId, setRenamingListId] = useState<string | null>(null);
   const [renameListName, setRenameListName] = useState('');
+  const [timerPopupOpen, setTimerPopupOpen] = useState(false);
+  const [timerTab, setTimerTab] = useState<'countdown' | 'stopwatch'>('countdown');
+  const [cdHours, setCdHours] = useState('0');
+  const [cdMinutes, setCdMinutes] = useState('25');
+  const [cdSeconds, setCdSeconds] = useState('0');
+  const [swTargetHours, setSwTargetHours] = useState('1');
+  const [swTargetMinutes, setSwTargetMinutes] = useState('0');
+  const [swTargetSeconds, setSwTargetSeconds] = useState('0');
   const [title, setTitle] = useState('');
   const [selectedTime, setSelectedTime] = useState<{ startTime: string; endTime: string } | null>(null);
   const [startTime, setStartTime] = useState('07:00');
@@ -36,11 +55,24 @@ export function Widget() {
   const [recurrence, setRecurrence] = useState<TaskRecurrence>({ type: 'once', date: dateKey(new Date()) });
   const [customMode, setCustomMode] = useState(false);
   const [customDays, setCustomDays] = useState<number[]>([]);
+
+  // Inline Task Edit State (double-click on task)
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editHasTime, setEditHasTime] = useState(false);
+  const [editStartTime, setEditStartTime] = useState('07:00');
+  const [editEndTime, setEditEndTime] = useState('08:00');
+  const [editRecurrence, setEditRecurrence] = useState<TaskRecurrence>({ type: 'once', date: dateKey(new Date()) });
+  const [editCustomMode, setEditCustomMode] = useState(false);
+  const [editCustomDays, setEditCustomDays] = useState<number[]>([]);
+
   const [error, setError] = useState('');
   const taskInputRef = useRef<HTMLInputElement>(null);
   const listInputRef = useRef<HTMLInputElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const editTitleInputRef = useRef<HTMLInputElement>(null);
   const addingTask = useRef(false);
+  const savingTaskEdit = useRef(false);
   const addingList = useRef(false);
   const renamingList = useRef(false);
   const pointer = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
@@ -81,10 +113,12 @@ export function Widget() {
         setExpanded(false);
         setSelectedListId(null);
         setTimePickerOpen(false);
+        setTimerPopupOpen(false);
         setCreatingList(false);
         setNewListName('');
         setRenamingListId(null);
         setRenameListName('');
+        setEditingTaskId(null);
       }
     });
     const unsubscribeData = window.orbit.onDataChanged(() => {
@@ -105,7 +139,10 @@ export function Widget() {
       setRenamingListId(null);
       setRenameListName('');
     }
-  }, [data, selectedListId, renamingListId]);
+    if (editingTaskId && data && !data.tasks.some(task => task.id === editingTaskId)) {
+      setEditingTaskId(null);
+    }
+  }, [data, selectedListId, renamingListId, editingTaskId]);
 
   useLayoutEffect(() => {
     if (applyExpansion.current) {
@@ -118,8 +155,10 @@ export function Widget() {
   }, [expanded, data?.placement]);
 
   useEffect(() => {
-    window.orbit.setWidgetTransientInteraction(timePickerOpen || creatingList || Boolean(renamingListId));
-  }, [timePickerOpen, creatingList, renamingListId]);
+    window.orbit.setWidgetTransientInteraction(
+      timePickerOpen || timerPopupOpen || creatingList || Boolean(renamingListId) || Boolean(editingTaskId)
+    );
+  }, [timePickerOpen, timerPopupOpen, creatingList, renamingListId, editingTaskId]);
 
   useEffect(() => {
     if (!creatingList) return;
@@ -139,28 +178,59 @@ export function Widget() {
     return () => cancelAnimationFrame(frame);
   }, [renamingListId]);
 
-  const togglePanel = async () => {
+  useEffect(() => {
+    if (!editingTaskId) return;
+    const frame = requestAnimationFrame(() => {
+      editTitleInputRef.current?.focus();
+      editTitleInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [editingTaskId]);
+
+  const togglePanel = async (openTimerAfterExpand = false) => {
     if (transitioning.current) return;
     transitioning.current = true;
     setError('');
     try {
-      const opening = !expandedRef.current;
+      const opening = openTimerAfterExpand ? true : !expandedRef.current;
       if (!opening) {
         setSelectedListId(null);
         setTimePickerOpen(false);
+        setTimerPopupOpen(false);
         setCreatingList(false);
         setNewListName('');
         setRenamingListId(null);
         setRenameListName('');
+        setEditingTaskId(null);
       } else {
         await syncFromStorage();
       }
-      const placement = await window.orbit.expandWidget(opening);
-      setData(current => current ? { ...current, placement } : current);
-      expandedRef.current = opening;
-      if (opening) applyExpansion.current = true;
-      else applyCollapse.current = true;
-      setExpanded(opening);
+      if (opening !== expandedRef.current) {
+        const placement = await window.orbit.expandWidget(opening);
+        setData(current => current ? { ...current, placement } : current);
+        expandedRef.current = opening;
+        if (opening) applyExpansion.current = true;
+        else applyCollapse.current = true;
+        setExpanded(opening);
+      }
+      if (openTimerAfterExpand && data) {
+        setTimePickerOpen(false);
+        setTimerTab(data.timer.mode);
+        const total = data.timer.durationSeconds;
+        const hrs = Math.floor(total / 3600);
+        const mins = Math.floor((total % 3600) / 60);
+        const secs = total % 60;
+        if (data.timer.mode === 'countdown') {
+          setCdHours(String(hrs));
+          setCdMinutes(String(mins));
+          setCdSeconds(String(secs));
+        } else {
+          setSwTargetHours(String(hrs));
+          setSwTargetMinutes(String(mins));
+          setSwTargetSeconds(String(secs));
+        }
+        setTimerPopupOpen(true);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Unable to change the widget panel.');
     } finally {
@@ -168,14 +238,15 @@ export function Widget() {
     }
   };
 
-  const onPointerDown = (event: PointerEvent<HTMLButtonElement>) => {
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
+    if ((event.target as HTMLElement).closest('.orb-hover-controls')) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     pointer.current = { x: event.screenX, y: event.screenY, dragging: false };
   };
 
-  const onPointerMove = (event: PointerEvent<HTMLButtonElement>) => {
+  const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
     const active = pointer.current;
     if (!active) return;
     if (!active.dragging && Math.hypot(event.screenX - active.x, event.screenY - active.y) > 4) {
@@ -241,6 +312,83 @@ export function Widget() {
     }
   }
 
+  function startEditTask(task: OrbitTask) {
+    setError('');
+    setTimePickerOpen(false);
+    setTimerPopupOpen(false);
+    setEditingTaskId(task.id);
+    setEditTitle(task.title);
+    if (task.startTime && task.endTime) {
+      setEditHasTime(true);
+      setEditStartTime(task.startTime);
+      setEditEndTime(task.endTime);
+    } else if (task.time) {
+      setEditHasTime(true);
+      setEditStartTime(task.time);
+      const [h, m] = task.time.split(':').map(Number);
+      const nextH = (h + 1) % 24;
+      setEditEndTime(`${String(nextH).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
+    } else {
+      setEditHasTime(false);
+      setEditStartTime('07:00');
+      setEditEndTime('08:00');
+    }
+    const baseRec: TaskRecurrence = task.recurrence
+      ?? (task.daily ? { type: 'daily' } : { type: 'once', date: task.date || dateKey(new Date()) });
+    setEditRecurrence(baseRec);
+    if (baseRec.type === 'weekly') {
+      setEditCustomDays(baseRec.days);
+      const preset = getRecurrencePreset(baseRec, false);
+      setEditCustomMode(preset === 'custom');
+    } else {
+      setEditCustomDays([]);
+      setEditCustomMode(false);
+    }
+  }
+
+  function cancelEditTask() {
+    setEditingTaskId(null);
+    setError('');
+  }
+
+  async function submitEditTask(event: FormEvent) {
+    event.preventDefault();
+    if (!editingTaskId || savingTaskEdit.current) return;
+    const cleanTitle = editTitle.trim();
+    if (!cleanTitle) {
+      setError('A task title is required.');
+      return;
+    }
+    if (editHasTime && !isValidTimeRange(editStartTime, editEndTime)) {
+      setError('Choose valid times, with the end later than the start.');
+      return;
+    }
+    if (editRecurrence.type === 'weekly' && !editRecurrence.days.length) {
+      setError('Select at least one weekday for a custom recurrence.');
+      return;
+    }
+    setError('');
+    savingTaskEdit.current = true;
+    try {
+      const normalizedRecurrence: TaskRecurrence =
+        editRecurrence.type === 'once'
+          ? { type: 'once', date: editRecurrence.date || dateKey(new Date()) }
+          : editRecurrence;
+      await window.orbit.updateTask(editingTaskId, {
+        title: cleanTitle,
+        startTime: editHasTime ? editStartTime : undefined,
+        endTime: editHasTime ? editEndTime : undefined,
+        recurrence: normalizedRecurrence
+      });
+      await syncFromStorage();
+      setEditingTaskId(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to update this task.');
+    } finally {
+      savingTaskEdit.current = false;
+    }
+  }
+
   function confirmTimeSelection() {
     if (!isValidTimeRange(startTime, endTime)) {
       setError('Choose valid times, with the end later than the start.');
@@ -266,6 +414,7 @@ export function Widget() {
 
   function startCreateList() {
     setError('');
+    setTimerPopupOpen(false);
     setRenamingListId(null);
     setRenameListName('');
     setNewListName('');
@@ -303,6 +452,7 @@ export function Widget() {
 
   function startRenameList(list: OrbitList) {
     setError('');
+    setTimerPopupOpen(false);
     setCreatingList(false);
     setNewListName('');
     setSelectedListId(list.id);
@@ -353,6 +503,104 @@ export function Widget() {
     }
   }
 
+  function toggleTimerPopover() {
+    setError('');
+    setTimePickerOpen(false);
+    if (!timerPopupOpen && data) {
+      setTimerTab(data.timer.mode);
+      const total = data.timer.durationSeconds;
+      const hrs = Math.floor(total / 3600);
+      const mins = Math.floor((total % 3600) / 60);
+      const secs = total % 60;
+      if (data.timer.mode === 'countdown') {
+        setCdHours(String(hrs));
+        setCdMinutes(String(mins));
+        setCdSeconds(String(secs));
+      } else {
+        setSwTargetHours(String(hrs));
+        setSwTargetMinutes(String(mins));
+        setSwTargetSeconds(String(secs));
+      }
+    }
+    setTimerPopupOpen(open => !open);
+  }
+
+  function parseHmsSeconds(h: string, m: string, s: string): number {
+    const hrs = Math.max(0, Math.min(23, Math.floor(Number(h) || 0)));
+    const mins = Math.max(0, Math.min(59, Math.floor(Number(m) || 0)));
+    const secs = Math.max(0, Math.min(59, Math.floor(Number(s) || 0)));
+    return hrs * 3600 + mins * 60 + secs;
+  }
+
+  async function handleStartConfiguredTimer(event?: FormEvent) {
+    event?.preventDefault();
+    setError('');
+    try {
+      if (timerTab === 'countdown') {
+        const totalSeconds = parseHmsSeconds(cdHours, cdMinutes, cdSeconds);
+        if (totalSeconds < 1) {
+          setError('Set at least 1 second for the countdown.');
+          return;
+        }
+        const isCurrentSamePaused =
+          data?.timer.mode === 'countdown' &&
+          !data.timer.running &&
+          data.timer.durationSeconds === totalSeconds &&
+          data.timer.remainingSeconds > 0 &&
+          data.timer.remainingSeconds < totalSeconds;
+        if (!isCurrentSamePaused) {
+          await window.orbit.configureTimer({ mode: 'countdown', durationSeconds: totalSeconds });
+        }
+        await window.orbit.startTimer();
+      } else {
+        const targetSeconds = parseHmsSeconds(swTargetHours, swTargetMinutes, swTargetSeconds);
+        const isCurrentSamePaused =
+          data?.timer.mode === 'stopwatch' &&
+          !data.timer.running &&
+          data.timer.durationSeconds === targetSeconds &&
+          data.timer.elapsedSeconds > 0;
+        if (!isCurrentSamePaused) {
+          await window.orbit.configureTimer({ mode: 'stopwatch', durationSeconds: targetSeconds });
+        }
+        await window.orbit.startTimer();
+      }
+      await syncFromStorage();
+      setTimerPopupOpen(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to start timer.');
+    }
+  }
+
+  async function handleResumeActiveTimer() {
+    setError('');
+    try {
+      await window.orbit.startTimer();
+      await syncFromStorage();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to resume timer.');
+    }
+  }
+
+  async function handlePauseTimer() {
+    setError('');
+    try {
+      await window.orbit.pauseTimer();
+      await syncFromStorage();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to pause timer.');
+    }
+  }
+
+  async function handleResetTimer() {
+    setError('');
+    try {
+      await window.orbit.resetTimer();
+      await syncFromStorage();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to reset timer.');
+    }
+  }
+
   async function runAction(action: Promise<unknown>) {
     setError('');
     try {
@@ -373,9 +621,36 @@ export function Widget() {
     : data.tasks.filter(task => task.listId === 'daily' && isTaskScheduledForDate(task, today));
   const analytics = calculateProductivityAnalytics(data, now, activeListId);
   const orbPercent = calculateListDayProgress(data, now, activeListId).percent;
+
+  const timer = data.timer;
+  const isCountdownActive =
+    timer.mode === 'countdown' &&
+    (timer.running || (timer.remainingSeconds > 0 && timer.remainingSeconds < timer.durationSeconds));
+  const isStopwatchActive =
+    timer.mode === 'stopwatch' &&
+    (timer.running || timer.elapsedSeconds > 0);
+  const isTimerShowingInOrb = isCountdownActive || isStopwatchActive;
+
+  let orbLabel = `${orbPercent}%`;
+  let orbRatio = orbPercent / 100;
+  let orbHasHours = false;
+
+  if (isCountdownActive) {
+    orbHasHours = timer.durationSeconds >= 3600;
+    orbLabel = formatClockDisplay(timer.remainingSeconds, orbHasHours);
+    orbRatio = timer.durationSeconds > 0 ? Math.max(0, Math.min(1, timer.remainingSeconds / timer.durationSeconds)) : 0;
+  } else if (isStopwatchActive) {
+    orbHasHours = timer.elapsedSeconds >= 3600 || timer.durationSeconds >= 3600;
+    orbLabel = formatClockDisplay(timer.elapsedSeconds, timer.elapsedSeconds >= 3600);
+    const cycle = timer.durationSeconds > 0 ? timer.durationSeconds : 3600;
+    orbRatio = Math.max(0, Math.min(1, (timer.elapsedSeconds % cycle) / cycle || (timer.elapsedSeconds > 0 && timer.elapsedSeconds % cycle === 0 ? 1 : 0)));
+  }
+
   const size = data.settings.widgetSize === 'small' ? 74 : data.settings.widgetSize === 'large' ? 96 : 84;
+  const miniIconSize = data.settings.widgetSize === 'small' ? 9 : data.settings.widgetSize === 'large' ? 12 : 10;
   const circumference = 2 * Math.PI * 43;
   const activePreset = getRecurrencePreset(recurrence, customMode);
+  const editPreset = getRecurrencePreset(editRecurrence, editCustomMode);
   const rootStyle = {
     '--widget-size': `${size}px`,
     '--widget-opacity': data.settings.widgetOpacity / 100,
@@ -394,8 +669,10 @@ export function Widget() {
       if (expandedRef.current && event.target === event.currentTarget) void togglePanel();
     }}
   >
-    <button
-      className="orb"
+    <div
+      role="button"
+      tabIndex={0}
+      className={`orb ${isTimerShowingInOrb ? 'timer-active' : ''}`}
       aria-label={expanded ? 'Close task panel' : 'Open task panel'}
       aria-expanded={expanded}
       onPointerDown={onPointerDown}
@@ -414,6 +691,7 @@ export function Widget() {
         event.currentTarget.style.setProperty('--tilt-y', '0deg');
       }}
       onKeyDown={event => {
+        if (event.target !== event.currentTarget) return;
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
           void togglePanel();
@@ -422,10 +700,50 @@ export function Widget() {
     >
       {data.settings.showProgressRing && <svg viewBox="0 0 100 100" aria-hidden="true">
         <circle className="orb-track" cx="50" cy="50" r="43" />
-        <circle className="orb-progress" cx="50" cy="50" r="43" style={{ strokeDashoffset: circumference * (1 - orbPercent / 100) }} />
+        <circle className="orb-progress" cx="50" cy="50" r="43" style={{ strokeDashoffset: circumference * (1 - orbRatio) }} />
       </svg>}
-      <span>{orbPercent}%</span>
-    </button>
+      <span className={isTimerShowingInOrb ? (orbHasHours ? 'orb-timer-text compact' : 'orb-timer-text') : ''}>{orbLabel}</span>
+      {isTimerShowingInOrb && (
+        <div
+          className="orb-hover-controls"
+          role="group"
+          aria-label="Timer quick controls"
+          onPointerDown={event => event.stopPropagation()}
+          onClick={event => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="orb-mini-btn left"
+            title="Change timer"
+            aria-label="Change timer"
+            onClick={() => { void togglePanel(true); }}
+          >
+            <SlidersHorizontal size={miniIconSize} />
+          </button>
+          <button
+            type="button"
+            className="orb-mini-btn center"
+            title={timer.running ? 'Pause timer' : 'Resume timer'}
+            aria-label={timer.running ? 'Pause timer' : 'Resume timer'}
+            onClick={() => {
+              if (timer.running) void handlePauseTimer();
+              else void handleResumeActiveTimer();
+            }}
+          >
+            {timer.running ? <Pause size={miniIconSize} /> : <Play size={miniIconSize} />}
+          </button>
+          <button
+            type="button"
+            className="orb-mini-btn right"
+            title="Reset timer"
+            aria-label="Reset timer"
+            onClick={() => { void handleResetTimer(); }}
+          >
+            <RotateCcw size={miniIconSize} />
+          </button>
+        </div>
+      )}
+    </div>
     {expanded && <section className="widget-panel" aria-label="Task panel"
       onPointerDownCapture={() => window.orbit.setWidgetTransientInteraction(true)}>
       <header className="widget-head">
@@ -511,10 +829,177 @@ export function Widget() {
         <button type="button" className="add-list-button" aria-label="Create a list" title="Create a list" onClick={startCreateList}>
           <Plus size={15} />
         </button>
+        <button
+          type="button"
+          className={`timer-header-button ${timerPopupOpen || isTimerShowingInOrb ? 'active' : ''}`}
+          aria-label="Focus & study timer"
+          title="Focus & study timer"
+          onClick={toggleTimerPopover}
+        >
+          <Timer size={14} />
+        </button>
         <button type="button" className="open-dashboard-button" aria-label="Open Orbit" title="Open Orbit" onClick={() => window.orbit.openDashboard()}>
           <ExternalLink size={14} />
         </button>
       </header>
+
+      {timerPopupOpen && (
+        <div
+          className="orb-timer-popover"
+          role="dialog"
+          aria-label="Orb timer controls"
+          onKeyDown={event => {
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              setTimerPopupOpen(false);
+            }
+          }}
+        >
+          <div className="orb-timer-tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={timerTab === 'countdown'}
+              className={timerTab === 'countdown' ? 'selected' : ''}
+              onClick={() => { setError(''); setTimerTab('countdown'); }}
+            >Countdown</button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={timerTab === 'stopwatch'}
+              className={timerTab === 'stopwatch' ? 'selected' : ''}
+              onClick={() => { setError(''); setTimerTab('stopwatch'); }}
+            >Study Timer</button>
+          </div>
+
+          {timerTab === 'countdown' ? (
+            <form className="orb-timer-body" onSubmit={handleStartConfiguredTimer}>
+              <div className="orb-timer-caption">Pomodoro / Question countdown</div>
+              <div className="hms-grid">
+                <label>
+                  <span>Hr</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={cdHours}
+                    onChange={event => setCdHours(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Min</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={59}
+                    value={cdMinutes}
+                    onChange={event => setCdMinutes(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Sec</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={59}
+                    value={cdSeconds}
+                    onChange={event => setCdSeconds(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="orb-timer-presets">
+                {[
+                  { label: '5m', h: '0', m: '5', s: '0' },
+                  { label: '25m', h: '0', m: '25', s: '0' },
+                  { label: '45m', h: '0', m: '45', s: '0' },
+                  { label: '1h', h: '1', m: '0', s: '0' }
+                ].map(preset => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    onClick={() => {
+                      setCdHours(preset.h);
+                      setCdMinutes(preset.m);
+                      setCdSeconds(preset.s);
+                    }}
+                  >{preset.label}</button>
+                ))}
+              </div>
+              <div className="orb-timer-actions">
+                {timer.mode === 'countdown' && timer.running ? (
+                  <button type="button" className="secondary-btn" onClick={() => { void handlePauseTimer(); }}>
+                    <Pause size={12} /> Pause
+                  </button>
+                ) : (
+                  <button type="submit" className="primary-btn">
+                    <Play size={12} /> {timer.mode === 'countdown' && timer.remainingSeconds > 0 && timer.remainingSeconds < timer.durationSeconds ? 'Resume' : 'Start'}
+                  </button>
+                )}
+                <button type="button" className="secondary-btn" onClick={() => { void handleResetTimer(); }} title="Reset & show task %">
+                  <RotateCcw size={12} /> Reset
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form className="orb-timer-body" onSubmit={handleStartConfiguredTimer}>
+              <div className="orb-timer-caption">Target study duration (optional)</div>
+              <div className="hms-grid">
+                <label>
+                  <span>Hr</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={swTargetHours}
+                    onChange={event => setSwTargetHours(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Min</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={59}
+                    value={swTargetMinutes}
+                    onChange={event => setSwTargetMinutes(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Sec</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={59}
+                    value={swTargetSeconds}
+                    onChange={event => setSwTargetSeconds(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="orb-timer-status">
+                Studied: <strong>{formatClockDisplay(timer.mode === 'stopwatch' ? timer.elapsedSeconds : 0, true)}</strong>
+                {parseHmsSeconds(swTargetHours, swTargetMinutes, swTargetSeconds) > 0 && (
+                  <> / {formatClockDisplay(parseHmsSeconds(swTargetHours, swTargetMinutes, swTargetSeconds), true)}</>
+                )}
+              </div>
+              <div className="orb-timer-actions">
+                {timer.mode === 'stopwatch' && timer.running ? (
+                  <button type="button" className="secondary-btn" onClick={() => { void handlePauseTimer(); }}>
+                    <Pause size={12} /> Pause
+                  </button>
+                ) : (
+                  <button type="submit" className="primary-btn">
+                    <Play size={12} /> {timer.mode === 'stopwatch' && timer.elapsedSeconds > 0 ? 'Resume' : 'Start'}
+                  </button>
+                )}
+                <button type="button" className="secondary-btn" onClick={() => { void handleResetTimer(); }} title="Reset & show task %">
+                  <RotateCcw size={12} /> Reset
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      )}
+
       <div className="widget-add-wrap">
         <form className="widget-add" onSubmit={addTask}>
           <input
@@ -534,6 +1019,7 @@ export function Widget() {
             onClick={() => {
               setStartTime(selectedTime?.startTime ?? '07:00');
               setEndTime(selectedTime?.endTime ?? '08:00');
+              setTimerPopupOpen(false);
               setTimePickerOpen(open => !open);
               setError('');
             }}
@@ -621,11 +1107,141 @@ export function Widget() {
       </div>
       <div className="widget-tasks" aria-label="Tasks">
         {visibleTasks.length ? visibleTasks.map(task => {
+          if (editingTaskId === task.id) {
+            return (
+              <form
+                key={task.id}
+                className="widget-task-editor"
+                onSubmit={submitEditTask}
+                onKeyDown={event => {
+                  if (event.key === 'Escape') {
+                    event.preventDefault();
+                    cancelEditTask();
+                  }
+                }}
+              >
+                <div className="task-editor-top">
+                  <input
+                    ref={editTitleInputRef}
+                    value={editTitle}
+                    onChange={event => setEditTitle(event.target.value)}
+                    placeholder="Task title..."
+                    maxLength={100}
+                    aria-label="Edit task title"
+                  />
+                  <button
+                    type="button"
+                    className={`task-editor-time-toggle ${editHasTime ? 'active' : ''}`}
+                    onClick={() => setEditHasTime(value => !value)}
+                    title={editHasTime ? 'Remove time range' : 'Add time range'}
+                  >
+                    <Clock3 size={12} />
+                    <span>{editHasTime ? formatTimeRange(editStartTime, editEndTime) : 'No time'}</span>
+                  </button>
+                </div>
+
+                {editHasTime && (
+                  <div className="task-editor-times">
+                    <label>
+                      <span>Start</span>
+                      <input
+                        type="time"
+                        value={editStartTime}
+                        onChange={event => setEditStartTime(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>End</span>
+                      <input
+                        type="time"
+                        value={editEndTime}
+                        onChange={event => setEditEndTime(event.target.value)}
+                      />
+                    </label>
+                  </div>
+                )}
+
+                <div className="task-editor-recurrence">
+                  <button
+                    type="button"
+                    className={editPreset === 'once' ? 'selected' : ''}
+                    onClick={() => {
+                      setEditCustomMode(false);
+                      setEditRecurrence({ type: 'once', date: dateKey(new Date()) });
+                    }}
+                  >Today</button>
+                  <button
+                    type="button"
+                    className={editPreset === 'daily' ? 'selected' : ''}
+                    onClick={() => {
+                      setEditCustomMode(false);
+                      setEditRecurrence({ type: 'daily' });
+                    }}
+                  >Daily</button>
+                  <button
+                    type="button"
+                    className={editPreset === 'weekdays' ? 'selected' : ''}
+                    onClick={() => {
+                      setEditCustomMode(false);
+                      setEditRecurrence({ type: 'weekly', days: [1, 2, 3, 4, 5] });
+                    }}
+                  >Weekdays</button>
+                  <button
+                    type="button"
+                    className={editPreset === 'weekends' ? 'selected' : ''}
+                    onClick={() => {
+                      setEditCustomMode(false);
+                      setEditRecurrence({ type: 'weekly', days: [0, 6] });
+                    }}
+                  >Weekends</button>
+                  <button
+                    type="button"
+                    className={editPreset === 'custom' ? 'selected' : ''}
+                    onClick={() => {
+                      setEditCustomMode(true);
+                      setEditRecurrence({ type: 'weekly', days: editCustomDays });
+                    }}
+                  >Custom</button>
+                </div>
+
+                {editRecurrence.type === 'weekly' && (
+                  <div className="weekday-options">
+                    {[1, 2, 3, 4, 5, 6, 0].map(day => (
+                      <button
+                        type="button"
+                        key={day}
+                        className={editRecurrence.days.includes(day) ? 'selected' : ''}
+                        onClick={() => {
+                          const next = editRecurrence.days.includes(day)
+                            ? editRecurrence.days.filter(value => value !== day)
+                            : [...editRecurrence.days, day];
+                          setEditCustomMode(true);
+                          setEditCustomDays(next);
+                          setEditRecurrence({ type: 'weekly', days: next });
+                        }}
+                      >{['S', 'M', 'T', 'W', 'T', 'F', 'S'][day]}</button>
+                    ))}
+                  </div>
+                )}
+
+                <div className="task-editor-actions">
+                  <button type="button" className="cancel-btn" onClick={cancelEditTask}>Cancel</button>
+                  <button type="submit" className="save-btn">Save</button>
+                </div>
+              </form>
+            );
+          }
+
           const done = data.completions[today]?.[task.id] === true;
           const taskTime = task.startTime && task.endTime
             ? formatTimeRange(task.startTime, task.endTime)
             : task.time ? formatTaskTime(task.time) : '';
-          return <div className={`widget-task ${done ? 'done' : ''}`} key={task.id}>
+          return <div
+            className={`widget-task ${done ? 'done' : ''}`}
+            key={task.id}
+            onDoubleClick={() => startEditTask(task)}
+            title="Double-click to edit task"
+          >
             <button
               className="check"
               aria-label={`${done ? 'Mark incomplete' : 'Complete'} ${task.title}`}
@@ -650,6 +1266,9 @@ function WidgetAnalytics({ analytics }: { analytics: ReturnType<typeof calculate
     { label: 'DAILY PROGRESS', progress: analytics.daily }
   ];
 
+  const currentStreak = analytics.myDayCurrentStreak;
+  const maxStreak = analytics.myDayMaxStreak;
+
   return <footer className="widget-analytics" aria-label="Productivity statistics">
     <div className="analytics-cards">
       {cards.map(({ label, progress }) => {
@@ -669,14 +1288,28 @@ function WidgetAnalytics({ analytics }: { analytics: ReturnType<typeof calculate
         </article>;
       })}
     </div>
-    <section className="streak-card">
-      <strong>Active Streaks</strong>
+    <section
+      className="streak-card"
+      tabIndex={0}
+      aria-label={`My Day Active Streak: ${currentStreak} ${currentStreak === 1 ? 'day' : 'days'}, Max Streak: ${maxStreak} ${maxStreak === 1 ? 'day' : 'days'}`}
+    >
+      <div className="streak-card-head">
+        <strong>Active Streaks</strong>
+        <span className={`streak-fire-badge ${currentStreak > 0 ? 'lit' : ''}`}>
+          <Flame size={11} />
+          <span>{currentStreak} {currentStreak === 1 ? 'day' : 'days'}</span>
+        </span>
+      </div>
+      <div className="streak-tooltip" role="tooltip">
+        <div><span>Current Streak:</span> <b>{currentStreak} {currentStreak === 1 ? 'day' : 'days'}</b></div>
+        <div><span>Max Streak:</span> <b>{maxStreak} {maxStreak === 1 ? 'day' : 'days'}</b></div>
+      </div>
       {analytics.activeStreaks.length
-        ? <ul>{analytics.activeStreaks.slice(0, 3).map(streak => <li key={streak.taskId}>
+        ? <ul>{analytics.activeStreaks.slice(0, 2).map(streak => <li key={streak.taskId}>
           <span title={streak.title}>{streak.title}</span>
-          <small>{streak.days}d</small>
+          <small>🔥 {streak.days}d</small>
         </li>)}</ul>
-        : <p>No active habit streaks yet.</p>}
+        : <p>Complete My Day habits daily to build your streak.</p>}
     </section>
   </footer>;
 }

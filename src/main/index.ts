@@ -2,9 +2,7 @@ import { app, BrowserWindow, globalShortcut, ipcMain, Notification, screen } fro
 import { join } from 'node:path';
 import fs from 'node:fs';
 
-
 app.setName('Orbit');
-
 
 type TaskDraft = {
   title: string;
@@ -14,6 +12,12 @@ type TaskDraft = {
   daily: boolean;
   listId?: string;
   recurrence?: TaskRecurrence;
+};
+type TaskUpdatePatch = {
+  title: string;
+  startTime?: string;
+  endTime?: string;
+  recurrence: TaskRecurrence;
 };
 type SettingsPatch = Partial<OrbitData['settings']>;
 
@@ -41,7 +45,15 @@ const initialData: OrbitData = {
   completions: {},
   history: {},
   settings: defaultSettings,
-  timer: { durationSeconds: 25 * 60, remainingSeconds: 25 * 60, endAt: null, running: false }
+  timer: {
+    mode: 'countdown',
+    durationSeconds: 25 * 60,
+    remainingSeconds: 25 * 60,
+    elapsedSeconds: 0,
+    endAt: null,
+    startedAt: null,
+    running: false
+  }
 };
 
 let widget: BrowserWindow | null = null;
@@ -135,19 +147,33 @@ function normalizeData(value: unknown): OrbitData {
     timerSound: typeof rawSettings.timerSound === 'boolean' ? rawSettings.timerSound : defaultSettings.timerSound
   };
   if (settings.desktopOnly) settings.alwaysOnTop = false;
+  const mode = input.timer?.mode === 'stopwatch' ? 'stopwatch' : 'countdown';
   const durationSeconds = Number.isFinite(input.timer?.durationSeconds)
-    ? Math.max(60, Math.min(7200, input.timer!.durationSeconds))
+    ? Math.max(0, Math.min(86399, Math.round(input.timer!.durationSeconds)))
     : settings.defaultTimerMinutes * 60;
-  const timer = input.timer
+  const timer: OrbitData['timer'] = input.timer
     ? {
+        mode,
         durationSeconds,
         remainingSeconds: Number.isFinite(input.timer.remainingSeconds)
-          ? Math.max(0, Math.min(durationSeconds, input.timer.remainingSeconds))
+          ? Math.max(0, Math.min(86399, Math.round(input.timer.remainingSeconds)))
           : durationSeconds,
+        elapsedSeconds: Number.isFinite(input.timer.elapsedSeconds)
+          ? Math.max(0, Math.min(86399, Math.round(input.timer.elapsedSeconds)))
+          : 0,
         endAt: typeof input.timer.endAt === 'number' ? input.timer.endAt : null,
+        startedAt: typeof input.timer.startedAt === 'number' ? input.timer.startedAt : null,
         running: input.timer.running === true
       }
-    : { durationSeconds, remainingSeconds: durationSeconds, endAt: null, running: false };
+    : {
+        mode: 'countdown',
+        durationSeconds,
+        remainingSeconds: durationSeconds,
+        elapsedSeconds: 0,
+        endAt: null,
+        startedAt: null,
+        running: false
+      };
 
   const tasks: OrbitTask[] = (input.tasks ?? []).map((raw, index) => {
     if (!raw || typeof raw !== 'object') throw new Error(`Orbit task ${index + 1} is invalid.`);
@@ -308,6 +334,11 @@ function widgetPayload(): WidgetData {
 }
 
 function currentTimer(): OrbitData['timer'] {
+  if (storedData.timer.mode === 'stopwatch') {
+    if (!storedData.timer.running || !storedData.timer.startedAt) return storedData.timer;
+    const elapsedSeconds = Math.min(86399, Math.max(0, Math.floor((Date.now() - storedData.timer.startedAt) / 1000)));
+    return { ...storedData.timer, elapsedSeconds, running: true };
+  }
   if (!storedData.timer.running || !storedData.timer.endAt) return storedData.timer;
   const remainingSeconds = Math.max(0, Math.ceil((storedData.timer.endAt - Date.now()) / 1000));
   return { ...storedData.timer, remainingSeconds, running: remainingSeconds > 0 };
@@ -458,7 +489,8 @@ function getExpandedBounds(circleX: number, circleY: number, size: number): Elec
 
 function applyWidgetSettings() {
   if (!widget || widget.isDestroyed()) return;
-  widget.setAlwaysOnTop(storedData.settings.alwaysOnTop && !storedData.settings.desktopOnly);
+  const pinOnTop = storedData.settings.alwaysOnTop && !storedData.settings.desktopOnly;
+  widget.setAlwaysOnTop(pinOnTop, pinOnTop ? 'floating' : 'normal');
   const size = widgetSize();
   const [x, y] = widget.getPosition();
   if (expanded) {
@@ -469,6 +501,29 @@ function applyWidgetSettings() {
     const bounds = clampBounds(x, y, size, size);
     widget.setBounds({ ...bounds, width: size, height: size });
   }
+}
+
+function cycleWidgetSize(direction: 1 | -1) {
+  const order: OrbitData['settings']['widgetSize'][] = ['small', 'medium', 'large'];
+  const currentIndex = order.indexOf(storedData.settings.widgetSize);
+  const nextIndex = Math.max(0, Math.min(order.length - 1, currentIndex + direction));
+  if (nextIndex === currentIndex) return;
+  storedData.settings = { ...storedData.settings, widgetSize: order[nextIndex] };
+  persistData();
+  applyWidgetSettings();
+  broadcastDataChanged();
+}
+
+function toggleDesktopOverlayMode() {
+  const nextDesktopOnly = !storedData.settings.desktopOnly;
+  storedData.settings = {
+    ...storedData.settings,
+    desktopOnly: nextDesktopOnly,
+    alwaysOnTop: !nextDesktopOnly
+  };
+  persistData();
+  applyWidgetSettings();
+  broadcastDataChanged();
 }
 
 function createWidget() {
@@ -638,11 +693,11 @@ function repositionExpandedWidget() {
   sendWidgetData();
 }
 
-function notifyTimerComplete() {
+function notifyTimerComplete(body = 'Your Orbit timer has finished.') {
   if (!Notification.isSupported()) return;
   new Notification({
     title: 'Focus session complete',
-    body: 'Your Orbit timer has finished.',
+    body,
     silent: !storedData.settings.timerSound
   }).show();
 }
@@ -650,19 +705,48 @@ function notifyTimerComplete() {
 function syncTimerInterval() {
   if (timerInterval) clearInterval(timerInterval);
   timerInterval = null;
-  if (!storedData.timer.running || !storedData.timer.endAt) return;
+  if (!storedData.timer.running) return;
+  if (storedData.timer.mode === 'countdown' && !storedData.timer.endAt) return;
+  if (storedData.timer.mode === 'stopwatch' && !storedData.timer.startedAt) return;
+
   timerInterval = setInterval(() => {
     const timer = currentTimer();
+    if (timer.mode === 'stopwatch') {
+      sendTimerData();
+      return;
+    }
     if (timer.remainingSeconds > 0) {
       sendTimerData();
       return;
     }
-    storedData.timer = { ...storedData.timer, remainingSeconds: 0, endAt: null, running: false };
+    storedData.timer = {
+      ...storedData.timer,
+      remainingSeconds: 0,
+      endAt: null,
+      running: false
+    };
     persistData();
     syncTimerInterval();
     sendTimerData();
-    notifyTimerComplete();
+    notifyTimerComplete('Your Orbit countdown timer has finished.');
   }, 1000);
+}
+
+function validateRecurrence(raw: TaskRecurrence): TaskRecurrence {
+  if (!raw || typeof raw !== 'object') throw new Error('Task recurrence is invalid.');
+  if (raw.type === 'once') {
+    if (!isValidDateKey(raw.date)) throw new Error('The task date is invalid.');
+    return { type: 'once', date: raw.date };
+  }
+  if (raw.type === 'daily') {
+    return { type: 'daily' };
+  }
+  if (raw.type === 'weekly' && Array.isArray(raw.days)) {
+    const days = [...new Set(raw.days.filter(day => Number.isInteger(day) && day >= 0 && day <= 6))];
+    if (!days.length) throw new Error('Select at least one weekday for a custom recurrence.');
+    return { type: 'weekly', days };
+  }
+  throw new Error('Task recurrence is invalid.');
 }
 
 function registerIpc() {
@@ -702,20 +786,7 @@ function registerIpc() {
     }
     let recurrence: TaskRecurrence;
     if (draft.recurrence) {
-      if (draft.recurrence.type === 'once') {
-        if (!isValidDateKey(draft.recurrence.date)) throw new Error('The task date is invalid.');
-        recurrence = { type: 'once', date: draft.recurrence.date };
-      } else if (draft.recurrence.type === 'daily') {
-        recurrence = { type: 'daily' };
-      } else if (draft.recurrence.type === 'weekly') {
-        const days = [...new Set(draft.recurrence.days.filter(day =>
-          Number.isInteger(day) && day >= 0 && day <= 6
-        ))];
-        if (!days.length) throw new Error('Select at least one weekday for a custom recurrence.');
-        recurrence = { type: 'weekly', days };
-      } else {
-        throw new Error('Task recurrence is invalid.');
-      }
+      recurrence = validateRecurrence(draft.recurrence);
     } else if (draft.daily === true) {
       recurrence = { type: 'daily' };
     } else {
@@ -733,6 +804,52 @@ function registerIpc() {
       createdAt: new Date().toISOString()
     };
     storedData.tasks.push(task);
+    updateDailyHistory(dateKey());
+    persistData();
+    broadcastDataChanged();
+    return task;
+  });
+  ipcMain.handle('orbit:update-task', (_event, id: string, patch: TaskUpdatePatch) => {
+    const task = storedData.tasks.find(item => item.id === id);
+    if (!task) throw new Error('The selected task does not exist.');
+    if (!patch || typeof patch !== 'object') throw new Error('Task update is invalid.');
+    const title = typeof patch.title === 'string' ? patch.title.trim().slice(0, 100) : '';
+    if (!title) throw new Error('A task title is required.');
+
+    const hasStartTime = patch.startTime !== undefined && patch.startTime !== '';
+    const hasEndTime = patch.endTime !== undefined && patch.endTime !== '';
+    if (hasStartTime !== hasEndTime) throw new Error('Both a start time and end time are required.');
+
+    let startTime: string | undefined;
+    let endTime: string | undefined;
+    if (hasStartTime && hasEndTime) {
+      if (typeof patch.startTime !== 'string' || typeof patch.endTime !== 'string') {
+        throw new Error('Task times are invalid.');
+      }
+      const startMinutes = isValidClockTime(patch.startTime);
+      const endMinutes = isValidClockTime(patch.endTime);
+      if (startMinutes === null || endMinutes === null || endMinutes <= startMinutes) {
+        throw new Error('The end time must be later than a valid start time.');
+      }
+      startTime = patch.startTime;
+      endTime = patch.endTime;
+    }
+
+    const recurrence = validateRecurrence(patch.recurrence);
+    task.title = title;
+    if (startTime && endTime) {
+      task.startTime = startTime;
+      task.endTime = endTime;
+      delete task.time;
+    } else {
+      delete task.startTime;
+      delete task.endTime;
+      delete task.time;
+    }
+    task.recurrence = recurrence;
+    task.daily = recurrence.type === 'daily';
+    task.date = recurrence.type === 'once' ? recurrence.date : '';
+
     updateDailyHistory(dateKey());
     persistData();
     broadcastDataChanged();
@@ -842,9 +959,17 @@ function registerIpc() {
       next.widgetY = widgetY;
     }
     storedData.settings = next;
-    if (patch.defaultTimerMinutes !== undefined && !storedData.timer.running) {
+    if (patch.defaultTimerMinutes !== undefined && !storedData.timer.running && storedData.timer.mode === 'countdown') {
       const durationSeconds = next.defaultTimerMinutes * 60;
-      storedData.timer = { durationSeconds, remainingSeconds: durationSeconds, endAt: null, running: false };
+      storedData.timer = {
+        mode: 'countdown',
+        durationSeconds,
+        remainingSeconds: durationSeconds,
+        elapsedSeconds: 0,
+        endAt: null,
+        startedAt: null,
+        running: false
+      };
     }
     if (patch.startWithWindows !== undefined && app.isPackaged && process.platform === 'win32') {
       app.setLoginItemSettings({ openAtLogin: next.startWithWindows, path: process.execPath });
@@ -871,7 +996,15 @@ function registerIpc() {
   ipcMain.handle('orbit:reset-settings', () => {
     const position = clampBounds(100, 120, 84, 84);
     storedData.settings = { ...defaultSettings, widgetX: position.x, widgetY: position.y };
-    storedData.timer = { durationSeconds: 25 * 60, remainingSeconds: 25 * 60, endAt: null, running: false };
+    storedData.timer = {
+      mode: 'countdown',
+      durationSeconds: 25 * 60,
+      remainingSeconds: 25 * 60,
+      elapsedSeconds: 0,
+      endAt: null,
+      startedAt: null,
+      running: false
+    };
     if (app.isPackaged && process.platform === 'win32') app.setLoginItemSettings({ openAtLogin: false, path: process.execPath });
     expanded = false;
     transientInteractionActive = false;
@@ -887,35 +1020,80 @@ function registerIpc() {
   ipcMain.handle('orbit:timer-set-duration', (_event, minutes: number) => {
     if (!Number.isFinite(minutes) || minutes < 1 || minutes > 120) throw new Error('Timer duration must be between 1 and 120 minutes.');
     const durationSeconds = Math.round(minutes) * 60;
-    storedData.timer = { durationSeconds, remainingSeconds: durationSeconds, endAt: null, running: false };
-    persistData();
-    syncTimerInterval();
-    sendTimerData();
-  });
-  ipcMain.handle('orbit:timer-start', () => {
-    if (storedData.timer.remainingSeconds <= 0) {
-      storedData.timer.remainingSeconds = storedData.timer.durationSeconds;
-    }
     storedData.timer = {
-      ...storedData.timer,
-      endAt: Date.now() + storedData.timer.remainingSeconds * 1000,
-      running: true
+      mode: 'countdown',
+      durationSeconds,
+      remainingSeconds: durationSeconds,
+      elapsedSeconds: 0,
+      endAt: null,
+      startedAt: null,
+      running: false
     };
     persistData();
     syncTimerInterval();
     sendTimerData();
   });
+  ipcMain.handle('orbit:timer-configure', (_event, config: { mode: 'countdown' | 'stopwatch'; durationSeconds: number }) => {
+    const mode = config?.mode === 'stopwatch' ? 'stopwatch' : 'countdown';
+    const rawDuration = Number.isFinite(config?.durationSeconds) ? Math.round(config.durationSeconds) : 0;
+    if (mode === 'countdown' && (rawDuration < 1 || rawDuration > 86399)) {
+      throw new Error('Set at least 1 second for the countdown timer.');
+    }
+    const durationSeconds = Math.max(0, Math.min(86399, rawDuration));
+    storedData.timer = {
+      mode,
+      durationSeconds,
+      remainingSeconds: mode === 'countdown' ? durationSeconds : 0,
+      elapsedSeconds: 0,
+      endAt: null,
+      startedAt: null,
+      running: false
+    };
+    persistData();
+    syncTimerInterval();
+    sendTimerData();
+  });
+  ipcMain.handle('orbit:timer-start', () => {
+    const active = currentTimer();
+    if (active.mode === 'stopwatch') {
+      storedData.timer = {
+        ...active,
+        endAt: null,
+        startedAt: Date.now() - active.elapsedSeconds * 1000,
+        running: true
+      };
+    } else {
+      const remaining = active.remainingSeconds <= 0 ? Math.max(1, active.durationSeconds) : active.remainingSeconds;
+      storedData.timer = {
+        ...active,
+        remainingSeconds: remaining,
+        startedAt: null,
+        endAt: Date.now() + remaining * 1000,
+        running: true
+      };
+    }
+    persistData();
+    syncTimerInterval();
+    sendTimerData();
+  });
   ipcMain.handle('orbit:timer-pause', () => {
-    storedData.timer = { ...currentTimer(), endAt: null, running: false };
+    storedData.timer = {
+      ...currentTimer(),
+      endAt: null,
+      startedAt: null,
+      running: false
+    };
     persistData();
     syncTimerInterval();
     sendTimerData();
   });
   ipcMain.handle('orbit:timer-reset', () => {
     storedData.timer = {
-      durationSeconds: storedData.timer.durationSeconds,
-      remainingSeconds: storedData.timer.durationSeconds,
+      ...storedData.timer,
+      remainingSeconds: storedData.timer.mode === 'countdown' ? storedData.timer.durationSeconds : 0,
+      elapsedSeconds: 0,
       endAt: null,
+      startedAt: null,
       running: false
     };
     persistData();
@@ -992,22 +1170,38 @@ app.whenReady().then(() => {
     if (storedData.settings.startWithWindows && app.isPackaged && process.platform === 'win32') {
       app.setLoginItemSettings({ openAtLogin: true, path: process.execPath });
     }
-    if (storedData.timer.running && storedData.timer.endAt) {
-      if (currentTimer().remainingSeconds === 0) {
-        storedData.timer = { ...storedData.timer, remainingSeconds: 0, endAt: null, running: false };
-        persistData();
-        timerFinishedOnStartup = true;
-      } else {
+    if (storedData.timer.running) {
+      if (storedData.timer.mode === 'countdown' && storedData.timer.endAt) {
+        if (currentTimer().remainingSeconds === 0) {
+          storedData.timer = { ...storedData.timer, remainingSeconds: 0, endAt: null, running: false };
+          persistData();
+          timerFinishedOnStartup = true;
+        } else {
+          syncTimerInterval();
+        }
+      } else if (storedData.timer.mode === 'stopwatch' && storedData.timer.startedAt) {
         syncTimerInterval();
       }
     }
     sendWidgetData();
+
+    // Global Shortcuts
     globalShortcut.register('Control+Alt+Space', () => {
       if (!widget || widget.isDestroyed()) return;
       if (widget.isVisible()) widget.hide();
       else { widget.show(); applyWidgetSettings(); }
     });
-    debugLog('Registered Ctrl+Alt+Space widget visibility shortcut');
+    globalShortcut.register('Control+Shift+Z', () => {
+      cycleWidgetSize(1);
+    });
+    globalShortcut.register('Control+Shift+X', () => {
+      cycleWidgetSize(-1);
+    });
+    globalShortcut.register('Control+Shift+Space', () => {
+      toggleDesktopOverlayMode();
+    });
+
+    debugLog('Registered global widget shortcuts');
     app.on('activate', createDashboard);
     app.on('window-all-closed', () => debugLog('All windows closed; keeping widget process and timer alive'));
     screen.on('display-metrics-changed', () => applyWidgetSettings());

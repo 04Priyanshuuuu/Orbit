@@ -11,6 +11,12 @@ const orbitApi = {
     listId?: string;
     recurrence?: TaskRecurrence;
   }) => ipcRenderer.invoke('orbit:add-task', draft),
+  updateTask: (id: string, patch: {
+    title: string;
+    startTime?: string;
+    endTime?: string;
+    recurrence: TaskRecurrence;
+  }) => ipcRenderer.invoke('orbit:update-task', id, patch),
   toggleTask: (id: string) => ipcRenderer.invoke('orbit:toggle-task', id),
   removeTask: (id: string) => ipcRenderer.invoke('orbit:remove-task', id),
   addList: (name: string) => ipcRenderer.invoke('orbit:add-list', name),
@@ -20,6 +26,8 @@ const orbitApi = {
   resetPosition: () => ipcRenderer.invoke('orbit:reset-position'),
   resetSettings: () => ipcRenderer.invoke('orbit:reset-settings'),
   setTimerDuration: (minutes: number) => ipcRenderer.invoke('orbit:timer-set-duration', minutes),
+  configureTimer: (config: { mode: 'countdown' | 'stopwatch'; durationSeconds: number }) =>
+    ipcRenderer.invoke('orbit:timer-configure', config),
   startTimer: () => ipcRenderer.invoke('orbit:timer-start'),
   pauseTimer: () => ipcRenderer.invoke('orbit:timer-pause'),
   resetTimer: () => ipcRenderer.invoke('orbit:timer-reset'),

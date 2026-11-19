@@ -27,6 +27,12 @@ declare global {
     listId?: string;
     recurrence?: TaskRecurrence;
   };
+  type OrbitTaskPatch = {
+    title: string;
+    startTime?: string;
+    endTime?: string;
+    recurrence: TaskRecurrence;
+  };
   type OrbitSettings = {
     widgetX: number;
     widgetY: number;
@@ -40,7 +46,15 @@ declare global {
     defaultTimerMinutes: number;
     timerSound: boolean;
   };
-  type OrbitTimer = { durationSeconds: number; remainingSeconds: number; endAt: number | null; running: boolean };
+  type OrbitTimer = {
+    mode: 'countdown' | 'stopwatch';
+    durationSeconds: number;
+    remainingSeconds: number;
+    elapsedSeconds: number;
+    endAt: number | null;
+    startedAt: number | null;
+    running: boolean;
+  };
   type OrbitDailyHistory = {
     totalTasks: number;
     completedTasks: number;
@@ -73,6 +87,7 @@ declare global {
     orbit: {
       getData: () => Promise<OrbitData>;
       addTask: (draft: OrbitTaskDraft) => Promise<OrbitTask>;
+      updateTask: (id: string, patch: OrbitTaskPatch) => Promise<OrbitTask>;
       toggleTask: (id: string) => Promise<void>;
       removeTask: (id: string) => Promise<void>;
       addList: (name: string) => Promise<OrbitList>;
@@ -82,6 +97,7 @@ declare global {
       resetPosition: () => Promise<boolean>;
       resetSettings: () => Promise<OrbitSettings>;
       setTimerDuration: (minutes: number) => Promise<void>;
+      configureTimer: (config: { mode: 'countdown' | 'stopwatch'; durationSeconds: number }) => Promise<void>;
       startTimer: () => Promise<void>;
       pauseTimer: () => Promise<void>;
       resetTimer: () => Promise<void>;

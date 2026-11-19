@@ -32,6 +32,7 @@ const orbitApi = {
   pauseTimer: () => ipcRenderer.invoke('orbit:timer-pause'),
   resetTimer: () => ipcRenderer.invoke('orbit:timer-reset'),
   expandWidget: (expanded: boolean) => ipcRenderer.invoke('orbit:expand-widget', expanded),
+  setPanelPinned: (pinned: boolean) => ipcRenderer.invoke('orbit:set-panel-pinned', pinned),
   applyWidgetExpansion: () => ipcRenderer.send('orbit:apply-widget-expansion'),
   applyWidgetCollapse: () => ipcRenderer.send('orbit:apply-widget-collapse'),
   openDashboard: () => ipcRenderer.send('orbit:open-dashboard'),

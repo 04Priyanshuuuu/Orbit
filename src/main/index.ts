@@ -26,10 +26,15 @@ const isValidClockTime = (value: string) => {
   return match ? Number(match[1]) * 60 + Number(match[2]) : null;
 };
 
+const MIN_ORB_SIZE = 74;
+const MEDIUM_ORB_SIZE = 116;
+const SIZE_STEP_PX = 38;
+
 const defaultSettings: OrbitData['settings'] = {
   widgetX: 100,
   widgetY: 120,
   widgetSize: 'medium',
+  customOrbSize: MEDIUM_ORB_SIZE,
   widgetOpacity: 78,
   showProgressRing: true,
   alwaysOnTop: true,
@@ -59,13 +64,17 @@ const initialData: OrbitData = {
 let widget: BrowserWindow | null = null;
 let dashboard: BrowserWindow | null = null;
 let expanded = false;
+let panelPinned = false;
+let orbHiddenWhilePinned = false;
 let expandedPlacement: WidgetData['placement'] = {
   panelRight: true,
   orbX: 0,
   orbY: 0,
+  orbSize: MEDIUM_ORB_SIZE,
+  panelY: 0,
   panelWidth: 390,
   panelHeight: 560,
-  windowWidth: 484,
+  windowWidth: 518,
   windowHeight: 560
 };
 let pendingExpandedBounds: Electron.Rectangle | null = null;
@@ -81,8 +90,36 @@ const backupPath = () => `${filePath()}.bak`;
 const temporaryPath = () => `${filePath()}.tmp`;
 const panelWidth = 390;
 const panelHeight = 560;
-const panelGap = 10;
-const widgetSize = (data = storedData) => data.settings.widgetSize === 'small' ? 74 : data.settings.widgetSize === 'large' ? 96 : 84;
+const panelGap = 12;
+
+function getWorkAreaForWidget() {
+  if (widget && !widget.isDestroyed()) {
+    return screen.getDisplayMatching(widget.getBounds()).workArea;
+  }
+  return screen.getDisplayNearestPoint({
+    x: storedData?.settings.widgetX ?? 100,
+    y: storedData?.settings.widgetY ?? 120
+  }).workArea;
+}
+
+const maxOrbSize = () => Math.max(240, getWorkAreaForWidget().height);
+
+const widgetSize = (data = storedData) => {
+  const ceiling = maxOrbSize();
+  if (Number.isFinite(data.settings.customOrbSize)) {
+    return Math.max(MIN_ORB_SIZE, Math.min(ceiling, Math.round(data.settings.customOrbSize!)));
+  }
+  if (data.settings.widgetSize === 'small') return MIN_ORB_SIZE;
+  if (data.settings.widgetSize === 'large') return ceiling;
+  return MEDIUM_ORB_SIZE;
+};
+
+function sizeLabelForPx(px: number): OrbitData['settings']['widgetSize'] {
+  if (px <= MIN_ORB_SIZE + 12) return 'small';
+  if (px >= maxOrbSize() - 24) return 'large';
+  return 'medium';
+}
+
 const debugLog = (...values: unknown[]) => {
   if (!app.isPackaged) console.info('[Orbit]', ...values);
 };
@@ -125,14 +162,19 @@ function normalizeData(value: unknown): OrbitData {
     throw new Error('Orbit daily history data is invalid.');
   }
   const rawSettings: Partial<OrbitData['settings']> = input.settings ?? {};
-  const settings = {
+  const resolvedSizeLabel = ['small', 'medium', 'large'].includes(rawSettings.widgetSize ?? '')
+    ? rawSettings.widgetSize!
+    : defaultSettings.widgetSize;
+  const fallbackPx = resolvedSizeLabel === 'small' ? MIN_ORB_SIZE : resolvedSizeLabel === 'large' ? 680 : MEDIUM_ORB_SIZE;
+  const settings: OrbitData['settings'] = {
     ...defaultSettings,
     ...rawSettings,
     widgetX: Number.isFinite(rawSettings.widgetX) ? rawSettings.widgetX! : defaultSettings.widgetX,
     widgetY: Number.isFinite(rawSettings.widgetY) ? rawSettings.widgetY! : defaultSettings.widgetY,
-    widgetSize: ['small', 'medium', 'large'].includes(rawSettings.widgetSize ?? '')
-      ? rawSettings.widgetSize!
-      : defaultSettings.widgetSize,
+    widgetSize: resolvedSizeLabel,
+    customOrbSize: Number.isFinite(rawSettings.customOrbSize)
+      ? Math.max(MIN_ORB_SIZE, Math.round(rawSettings.customOrbSize!))
+      : fallbackPx,
     widgetOpacity: Number.isFinite(rawSettings.widgetOpacity)
       ? Math.max(35, Math.min(100, Math.round(rawSettings.widgetOpacity!)))
       : defaultSettings.widgetOpacity,
@@ -329,7 +371,12 @@ function widgetPayload(): WidgetData {
     settings: storedData.settings,
     timer: currentTimer(),
     expanded,
-    placement: expandedPlacement
+    pinned: panelPinned,
+    orbHidden: orbHiddenWhilePinned,
+    placement: {
+      ...expandedPlacement,
+      orbSize: widgetSize()
+    }
   };
 }
 
@@ -377,66 +424,7 @@ function loadRenderer(target: BrowserWindow, hash: string) {
     if (app.isPackaged || target.isDestroyed()) return;
     await new Promise(resolve => setTimeout(resolve, 1500));
     if (target.isDestroyed()) return;
-    const rendererState = await target.webContents.executeJavaScript(`({
-      url: location.href,
-      readyState: document.readyState,
-      rootFound: !!document.getElementById('root'),
-      rootChildren: Array.from(document.getElementById('root')?.children ?? []).map(element => {
-        const style = getComputedStyle(element);
-        const bounds = element.getBoundingClientRect();
-        return {
-          tag: element.tagName,
-          className: typeof element.className === 'string' ? element.className : '',
-          textLength: element.textContent?.length ?? 0,
-          display: style.display,
-          visibility: style.visibility,
-          opacity: style.opacity,
-          width: bounds.width,
-          height: bounds.height
-        };
-      }),
-      stylesheetCount: document.styleSheets.length,
-      orbitBridgeAvailable: typeof window.orbit !== 'undefined',
-      viewport: { width: innerWidth, height: innerHeight }
-    })`);
-    debugLog(`${hash} renderer DOM state`, rendererState);
   }).catch(error => console.error(`Unable to load or inspect the Orbit ${hash} window.`, error));
-}
-
-function logWindowDiagnostics(name: string, window: BrowserWindow, transparent: boolean) {
-  if (app.isPackaged) return;
-  const [width, height] = window.getSize();
-  debugLog(`${name} created`, {
-    bounds: window.getBounds(),
-    size: { width, height },
-    visible: window.isVisible(),
-    minimized: window.isMinimized(),
-    transparent
-  });
-  window.on('ready-to-show', () => {
-    debugLog(`${name} ready-to-show`, { visible: window.isVisible(), bounds: window.getBounds() });
-    if (!window.isVisible()) window.show();
-  });
-  window.on('show', () => debugLog(`${name} shown`));
-  window.on('hide', () => debugLog(`${name} hidden`));
-  window.on('minimize', () => debugLog(`${name} minimized`));
-  window.on('restore', () => debugLog(`${name} restored`));
-  window.on('focus', () => debugLog(`${name} focused`));
-  window.on('closed', () => debugLog(`${name} closed`));
-  window.webContents.on('did-finish-load', () => debugLog(`${name} renderer finished loading`, window.webContents.getURL()));
-  window.webContents.on('did-fail-load', (_event, code, description, validatedURL, isMainFrame) => {
-    console.error(`[Orbit] ${name} renderer failed to load`, { code, description, validatedURL, isMainFrame });
-  });
-  window.webContents.on('preload-error', (_event, preloadPath, error) => {
-    console.error(`[Orbit] ${name} preload failed`, { preloadPath, error });
-  });
-  window.webContents.on('console-message', (_event, level, message, line, sourceId) => {
-    if (level >= 2) console.error(`[Orbit] ${name} renderer console`, { level, message, line, sourceId });
-    else if (level === 1) console.warn(`[Orbit] ${name} renderer console`, { message, line, sourceId });
-  });
-  window.webContents.on('render-process-gone', (_event, details) => {
-    console.error(`[Orbit] ${name} renderer process exited`, details);
-  });
 }
 
 function clampBounds(x: number, y: number, width: number, height: number) {
@@ -467,18 +455,23 @@ function getExpandedBounds(circleX: number, circleY: number, size: number): Elec
   const actualPanelWidth = Math.min(panelWidth, Math.max(0, availableSideSpace - panelGap));
   const actualPanelHeight = Math.min(panelHeight, workArea.height);
   const windowWidth = actualPanelWidth + panelGap + size;
-  const windowHeight = actualPanelHeight;
+  const windowHeight = Math.max(actualPanelHeight, size);
   const orbX = panelRight ? 0 : actualPanelWidth + panelGap;
+  const clampedCircleY = Math.max(workArea.y, Math.min(circleY, workArea.y + workArea.height - size));
   const desiredX = panelRight ? circleX : circleX - windowWidth + size;
-  const desiredY = circleY - Math.round((windowHeight - size) / 2);
+  const desiredY = clampedCircleY - Math.round((windowHeight - size) / 2);
   const bounds = {
-    x: desiredX,
+    x: Math.max(workArea.x, Math.min(desiredX, workArea.x + workArea.width - windowWidth)),
     y: Math.max(workArea.y, Math.min(desiredY, workArea.y + workArea.height - windowHeight))
   };
+  const orbY = Math.max(0, Math.min(clampedCircleY - bounds.y, windowHeight - size));
+  const panelY = Math.max(0, Math.min(Math.round((windowHeight - actualPanelHeight) / 2), windowHeight - actualPanelHeight));
   expandedPlacement = {
     panelRight,
     orbX,
-    orbY: circleY - bounds.y,
+    orbY,
+    orbSize: size,
+    panelY,
     panelWidth: actualPanelWidth,
     panelHeight: actualPanelHeight,
     windowWidth,
@@ -503,12 +496,16 @@ function applyWidgetSettings() {
   }
 }
 
-function cycleWidgetSize(direction: 1 | -1) {
-  const order: OrbitData['settings']['widgetSize'][] = ['small', 'medium', 'large'];
-  const currentIndex = order.indexOf(storedData.settings.widgetSize);
-  const nextIndex = Math.max(0, Math.min(order.length - 1, currentIndex + direction));
-  if (nextIndex === currentIndex) return;
-  storedData.settings = { ...storedData.settings, widgetSize: order[nextIndex] };
+function stepWidgetSize(direction: 1 | -1) {
+  const currentPx = widgetSize();
+  const ceiling = maxOrbSize();
+  const nextPx = Math.max(MIN_ORB_SIZE, Math.min(ceiling, currentPx + direction * SIZE_STEP_PX));
+  if (nextPx === currentPx) return;
+  storedData.settings = {
+    ...storedData.settings,
+    customOrbSize: nextPx,
+    widgetSize: sizeLabelForPx(nextPx)
+  };
   persistData();
   applyWidgetSettings();
   broadcastDataChanged();
@@ -557,7 +554,6 @@ function createWidget() {
       sandbox: true
     }
   });
-  logWindowDiagnostics('Widget', widget, true);
   loadRenderer(widget, 'widget');
   widget.on('blur', () => {
     setTimeout(collapseWidgetOnBlur, 120);
@@ -574,7 +570,6 @@ function createDashboard() {
     if (dashboard.isMinimized()) dashboard.restore();
     dashboard.show();
     dashboard.focus();
-    debugLog('Reused existing dashboard window', { bounds: dashboard.getBounds() });
     return;
   }
   dashboard = new BrowserWindow({
@@ -585,7 +580,7 @@ function createDashboard() {
     title: 'Orbit',
     show: true,
     transparent: false,
-    backgroundColor: '#0b1119',
+    backgroundColor: '#06080b',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -593,7 +588,6 @@ function createDashboard() {
       sandbox: true
     }
   });
-  logWindowDiagnostics('Dashboard', dashboard, false);
   loadRenderer(dashboard, 'app');
   dashboard.on('closed', () => { dashboard = null; });
   dashboard.webContents.on('did-finish-load', () => {
@@ -614,20 +608,22 @@ function prepareWidgetExpansion() {
 
 function prepareWidgetCollapse() {
   pendingExpandedBounds = null;
+  const size = widgetSize();
   if (!widget || widget.isDestroyed() || !expanded) {
     expandedPlacement = {
       panelRight: true,
       orbX: 0,
       orbY: 0,
+      orbSize: size,
+      panelY: 0,
       panelWidth,
       panelHeight,
-      windowWidth: panelWidth + panelGap + widgetSize(),
-      windowHeight: panelHeight
+      windowWidth: panelWidth + panelGap + size,
+      windowHeight: Math.max(panelHeight, size)
     };
     return expandedPlacement;
   }
   const [windowX, windowY] = widget.getPosition();
-  const size = widgetSize();
   const x = windowX + expandedPlacement.orbX;
   const y = windowY + expandedPlacement.orbY;
   pendingCollapsedBounds = { ...clampBounds(x, y, size, size), width: size, height: size };
@@ -635,16 +631,19 @@ function prepareWidgetCollapse() {
     panelRight: true,
     orbX: 0,
     orbY: 0,
+    orbSize: size,
+    panelY: 0,
     panelWidth,
     panelHeight,
     windowWidth: panelWidth + panelGap + size,
-    windowHeight: panelHeight
+    windowHeight: Math.max(panelHeight, size)
   };
 }
 
 function applyWidgetExpansion(event: Electron.IpcMainEvent) {
   if (!widget || widget.isDestroyed() || event.sender !== widget.webContents || !pendingExpandedBounds) return;
   expanded = true;
+  orbHiddenWhilePinned = false;
   pendingCollapsedBounds = null;
   if (dragStart) {
     dragStart.windowX = pendingExpandedBounds.x;
@@ -660,6 +659,8 @@ function applyWidgetCollapse(event: Electron.IpcMainEvent) {
   if (expanded && pendingCollapsedBounds) {
     widget.setBounds(pendingCollapsedBounds, true);
     expanded = false;
+    panelPinned = false;
+    orbHiddenWhilePinned = false;
     transientInteractionActive = false;
     persistPosition();
   }
@@ -670,7 +671,7 @@ function applyWidgetCollapse(event: Electron.IpcMainEvent) {
 
 function collapseWidgetOnBlur() {
   if (!widget || widget.isDestroyed() || !expanded || widget.isFocused()) return;
-  if (transientInteractionActive) return;
+  if (panelPinned || transientInteractionActive) return;
   pendingCollapsedBounds = null;
   const circleX = widget.getBounds().x + expandedPlacement.orbX;
   const circleY = widget.getBounds().y + expandedPlacement.orbY;
@@ -678,6 +679,7 @@ function collapseWidgetOnBlur() {
   const bounds = { ...clampBounds(circleX, circleY, size, size), width: size, height: size };
   widget.setBounds(bounds, true);
   expanded = false;
+  orbHiddenWhilePinned = false;
   transientInteractionActive = false;
   persistPosition();
   sendWidgetData();
@@ -750,8 +752,7 @@ function validateRecurrence(raw: TaskRecurrence): TaskRecurrence {
 }
 
 function registerIpc() {
-  ipcMain.handle('orbit:get-data', event => {
-    debugLog('Received orbit:get-data', event.sender.getURL());
+  ipcMain.handle('orbit:get-data', () => {
     return { ...storedData, timer: currentTimer() };
   });
   ipcMain.handle('orbit:add-task', (_event, draft: TaskDraft) => {
@@ -946,7 +947,20 @@ function registerIpc() {
   ipcMain.handle('orbit:update-settings', (_event, patch: SettingsPatch) => {
     if (!patch || typeof patch !== 'object') throw new Error('Settings update is invalid.');
     const next = { ...storedData.settings, ...patch };
-    if (patch.widgetSize && !['small', 'medium', 'large'].includes(patch.widgetSize)) throw new Error('Widget size is invalid.');
+    if (patch.widgetSize) {
+      if (!['small', 'medium', 'large'].includes(patch.widgetSize)) throw new Error('Widget size is invalid.');
+      if (patch.customOrbSize === undefined) {
+        next.customOrbSize = patch.widgetSize === 'small'
+          ? MIN_ORB_SIZE
+          : patch.widgetSize === 'large'
+            ? maxOrbSize()
+            : MEDIUM_ORB_SIZE;
+      }
+    }
+    if (patch.customOrbSize !== undefined) {
+      next.customOrbSize = Math.max(MIN_ORB_SIZE, Math.min(maxOrbSize(), Math.round(patch.customOrbSize)));
+      next.widgetSize = sizeLabelForPx(next.customOrbSize);
+    }
     if (patch.widgetOpacity !== undefined) next.widgetOpacity = Math.max(35, Math.min(100, Math.round(patch.widgetOpacity)));
     if (patch.defaultTimerMinutes !== undefined) next.defaultTimerMinutes = Math.max(1, Math.min(120, Math.round(patch.defaultTimerMinutes)));
     if (patch.desktopOnly === true) next.alwaysOnTop = false;
@@ -984,6 +998,8 @@ function registerIpc() {
     storedData.settings = { ...storedData.settings, widgetX: position.x, widgetY: position.y };
     if (widget && !widget.isDestroyed()) {
       expanded = false;
+      panelPinned = false;
+      orbHiddenWhilePinned = false;
       transientInteractionActive = false;
       pendingExpandedBounds = null;
       pendingCollapsedBounds = null;
@@ -994,7 +1010,7 @@ function registerIpc() {
     return true;
   });
   ipcMain.handle('orbit:reset-settings', () => {
-    const position = clampBounds(100, 120, 84, 84);
+    const position = clampBounds(100, 120, MEDIUM_ORB_SIZE, MEDIUM_ORB_SIZE);
     storedData.settings = { ...defaultSettings, widgetX: position.x, widgetY: position.y };
     storedData.timer = {
       mode: 'countdown',
@@ -1007,6 +1023,8 @@ function registerIpc() {
     };
     if (app.isPackaged && process.platform === 'win32') app.setLoginItemSettings({ openAtLogin: false, path: process.execPath });
     expanded = false;
+    panelPinned = false;
+    orbHiddenWhilePinned = false;
     transientInteractionActive = false;
     pendingExpandedBounds = null;
     pendingCollapsedBounds = null;
@@ -1104,10 +1122,16 @@ function registerIpc() {
     if (!widget || event.sender !== widget.webContents) throw new Error('Only the widget can change its expanded state.');
     return value ? prepareWidgetExpansion() : prepareWidgetCollapse();
   });
+  ipcMain.handle('orbit:set-panel-pinned', (event, pinned: boolean) => {
+    if (!widget || event.sender !== widget.webContents) throw new Error('Only the widget can pin the panel.');
+    panelPinned = pinned === true;
+    if (!panelPinned) orbHiddenWhilePinned = false;
+    sendWidgetData();
+    return panelPinned;
+  });
   ipcMain.on('orbit:apply-widget-expansion', event => applyWidgetExpansion(event));
   ipcMain.on('orbit:apply-widget-collapse', event => applyWidgetCollapse(event));
   ipcMain.on('orbit:open-dashboard', () => {
-    debugLog('Received orbit:open-dashboard');
     createDashboard();
   });
   ipcMain.on('orbit:begin-widget-drag', (event, point: { x: number; y: number }) => {
@@ -1148,17 +1172,11 @@ app.on('second-instance', () => {
     if (widget.isMinimized()) widget.restore();
     widget.show();
     applyWidgetSettings();
-    debugLog('Second instance requested widget visibility');
   }
 });
 
 app.whenReady().then(() => {
   if (!hasSingleInstanceLock) return;
-  debugLog('Application ready', {
-    packaged: app.isPackaged,
-    rendererUrl: process.env.ELECTRON_RENDERER_URL ?? null,
-    userDataPath: app.getPath('userData')
-  });
   try {
     loadData();
     if (!storedData.history[dateKey()]) {
@@ -1188,22 +1206,37 @@ app.whenReady().then(() => {
     // Global Shortcuts
     globalShortcut.register('Control+Alt+Space', () => {
       if (!widget || widget.isDestroyed()) return;
+      // When dialogue box is pinned, keep dialogue box visible and only toggle the circle!
+      if (expanded && panelPinned) {
+        if (!widget.isVisible()) {
+          widget.show();
+          orbHiddenWhilePinned = false;
+        } else {
+          orbHiddenWhilePinned = !orbHiddenWhilePinned;
+        }
+        sendWidgetData();
+        return;
+      }
       if (widget.isVisible()) widget.hide();
-      else { widget.show(); applyWidgetSettings(); }
+      else {
+        orbHiddenWhilePinned = false;
+        widget.show();
+        applyWidgetSettings();
+        sendWidgetData();
+      }
     });
     globalShortcut.register('Control+Shift+Z', () => {
-      cycleWidgetSize(1);
+      stepWidgetSize(1);
     });
     globalShortcut.register('Control+Shift+X', () => {
-      cycleWidgetSize(-1);
+      stepWidgetSize(-1);
     });
     globalShortcut.register('Control+Shift+Space', () => {
       toggleDesktopOverlayMode();
     });
 
-    debugLog('Registered global widget shortcuts');
     app.on('activate', createDashboard);
-    app.on('window-all-closed', () => debugLog('All windows closed; keeping widget process and timer alive'));
+    app.on('window-all-closed', () => {});
     screen.on('display-metrics-changed', () => applyWidgetSettings());
     screen.on('display-removed', () => applyWidgetSettings());
     if (timerFinishedOnStartup) notifyTimerComplete();

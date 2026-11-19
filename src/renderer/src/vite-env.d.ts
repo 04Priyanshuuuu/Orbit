@@ -37,6 +37,7 @@ declare global {
     widgetX: number;
     widgetY: number;
     widgetSize: 'small' | 'medium' | 'large';
+    customOrbSize?: number;
     widgetOpacity: number;
     showProgressRing: boolean;
     alwaysOnTop: boolean;
@@ -72,10 +73,14 @@ declare global {
   type WidgetData = OrbitData & {
     percent: number;
     expanded: boolean;
+    pinned?: boolean;
+    orbHidden?: boolean;
     placement: {
       panelRight: boolean;
       orbX: number;
       orbY: number;
+      orbSize?: number;
+      panelY?: number;
       panelWidth: number;
       panelHeight: number;
       windowWidth: number;
@@ -102,6 +107,7 @@ declare global {
       pauseTimer: () => Promise<void>;
       resetTimer: () => Promise<void>;
       expandWidget: (value: boolean) => Promise<WidgetData['placement']>;
+      setPanelPinned: (pinned: boolean) => Promise<boolean>;
       applyWidgetExpansion: () => void;
       applyWidgetCollapse: () => void;
       openDashboard: () => void;

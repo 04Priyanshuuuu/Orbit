@@ -1,5 +1,5 @@
 import { FormEvent, PointerEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Check, Clock3, ExternalLink, Flame, Pause, Play, Plus, RotateCcw, SlidersHorizontal, Timer } from 'lucide-react';
+import { Check, Clock3, ExternalLink, Flame, Pause, Pin, PinOff, Play, Plus, RotateCcw, SlidersHorizontal, Timer } from 'lucide-react';
 import { calculateListDayProgress, calculateProductivityAnalytics } from '../analytics';
 import { formatTaskTime, formatTimeRange, formatRecurrence, isTaskScheduledForDate, isValidTimeRange } from '../taskInput';
 import { TimePicker } from './TimePicker';
@@ -34,6 +34,8 @@ function formatClockDisplay(totalSeconds: number, forceHours = false): string {
 export function Widget() {
   const [data, setData] = useState<WidgetData | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const [orbHidden, setOrbHidden] = useState(false);
   const [selectedListId, setSelectedListId] = useState<string | null>(null);
   const [creatingList, setCreatingList] = useState(false);
   const [newListName, setNewListName] = useState('');
@@ -56,7 +58,6 @@ export function Widget() {
   const [customMode, setCustomMode] = useState(false);
   const [customDays, setCustomDays] = useState<number[]>([]);
 
-  // Inline Task Edit State (double-click on task)
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const [editHasTime, setEditHasTime] = useState(false);
@@ -75,7 +76,7 @@ export function Widget() {
   const savingTaskEdit = useRef(false);
   const addingList = useRef(false);
   const renamingList = useRef(false);
-  const pointer = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
+  const pointer = useRef<{ x: number; y: number; dragging: boolean; source: 'orb' | 'panel' } | null>(null);
   const expandedRef = useRef(false);
   const transitioning = useRef(false);
   const applyExpansion = useRef(false);
@@ -93,13 +94,17 @@ export function Widget() {
         ...value,
         percent,
         expanded: current?.expanded ?? expandedRef.current,
+        pinned: current?.pinned ?? pinned,
+        orbHidden: current?.orbHidden ?? orbHidden,
         placement: current?.placement ?? {
           panelRight: true,
           orbX: 0,
           orbY: 0,
+          orbSize: value.settings.customOrbSize ?? 116,
+          panelY: 0,
           panelWidth: 390,
           panelHeight: 560,
-          windowWidth: 484,
+          windowWidth: 518,
           windowHeight: 560
         }
       }));
@@ -108,9 +113,13 @@ export function Widget() {
   useEffect(() => {
     const unsubscribeWidget = window.orbit.onWidgetData(value => {
       setData(value);
+      setPinned(Boolean(value.pinned));
+      setOrbHidden(Boolean(value.orbHidden));
       if (!value.expanded) {
         expandedRef.current = false;
         setExpanded(false);
+        setPinned(false);
+        setOrbHidden(false);
         setSelectedListId(null);
         setTimePickerOpen(false);
         setTimerPopupOpen(false);
@@ -156,9 +165,9 @@ export function Widget() {
 
   useEffect(() => {
     window.orbit.setWidgetTransientInteraction(
-      timePickerOpen || timerPopupOpen || creatingList || Boolean(renamingListId) || Boolean(editingTaskId)
+      pinned || timePickerOpen || timerPopupOpen || creatingList || Boolean(renamingListId) || Boolean(editingTaskId)
     );
-  }, [timePickerOpen, timerPopupOpen, creatingList, renamingListId, editingTaskId]);
+  }, [pinned, timePickerOpen, timerPopupOpen, creatingList, renamingListId, editingTaskId]);
 
   useEffect(() => {
     if (!creatingList) return;
@@ -194,6 +203,8 @@ export function Widget() {
     try {
       const opening = openTimerAfterExpand ? true : !expandedRef.current;
       if (!opening) {
+        setPinned(false);
+        setOrbHidden(false);
         setSelectedListId(null);
         setTimePickerOpen(false);
         setTimerPopupOpen(false);
@@ -238,15 +249,36 @@ export function Widget() {
     }
   };
 
-  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+  async function togglePinPanel() {
+    setError('');
+    try {
+      const next = await window.orbit.setPanelPinned(!pinned);
+      setPinned(next);
+      if (!next) setOrbHidden(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to pin panel.');
+    }
+  }
+
+  const onOrbPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     if ((event.target as HTMLElement).closest('.orb-hover-controls')) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
-    pointer.current = { x: event.screenX, y: event.screenY, dragging: false };
+    pointer.current = { x: event.screenX, y: event.screenY, dragging: false, source: 'orb' };
   };
 
-  const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+  const onPanelPointerDown = (event: PointerEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('button, input, label, select, textarea, a, .widget-tasks, .orb-timer-popover, .scheduling-popup')) {
+      return;
+    }
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointer.current = { x: event.screenX, y: event.screenY, dragging: false, source: 'panel' };
+  };
+
+  const onPointerMove = (event: PointerEvent<HTMLElement>) => {
     const active = pointer.current;
     if (!active) return;
     if (!active.dragging && Math.hypot(event.screenX - active.x, event.screenY - active.y) > 4) {
@@ -260,8 +292,11 @@ export function Widget() {
     const active = pointer.current;
     if (!active) return;
     pointer.current = null;
-    if (active.dragging) window.orbit.endWidgetDrag();
-    else void togglePanel();
+    if (active.dragging) {
+      window.orbit.endWidgetDrag();
+    } else if (active.source === 'orb') {
+      void togglePanel();
+    }
   };
 
   const onPointerCancel = () => {
@@ -646,9 +681,20 @@ export function Widget() {
     orbRatio = Math.max(0, Math.min(1, (timer.elapsedSeconds % cycle) / cycle || (timer.elapsedSeconds > 0 && timer.elapsedSeconds % cycle === 0 ? 1 : 0)));
   }
 
-  const size = data.settings.widgetSize === 'small' ? 74 : data.settings.widgetSize === 'large' ? 96 : 84;
-  const miniIconSize = data.settings.widgetSize === 'small' ? 9 : data.settings.widgetSize === 'large' ? 12 : 10;
-  const circumference = 2 * Math.PI * 43;
+  const size = data.placement.orbSize ?? data.settings.customOrbSize ?? (data.settings.widgetSize === 'small' ? 74 : data.settings.widgetSize === 'large' ? 680 : 116);
+  const miniIconSize = Math.max(10, Math.min(15, Math.round(size * 0.125)));
+  const ringRadius = 47.4;
+  const circumference = 2 * Math.PI * ringRadius;
+
+  // Exact tip point on the circle in rotated SVG coordinates (0 rad = top 12 o'clock)
+  const tipAngle = orbRatio * 2 * Math.PI;
+  const tipX = 50 + ringRadius * Math.cos(tipAngle);
+  const tipY = 50 + ringRadius * Math.sin(tipAngle);
+  // Rotate sparkler emitter along the tangent direction of the burning tip
+  const tangentDeg = (tipAngle * 180) / Math.PI + 90;
+  const showSparkler = orbRatio > 0.005 && orbRatio < 0.998;
+  const isActivelyBurning = timer.running || (!isTimerShowingInOrb && orbRatio > 0);
+
   const activePreset = getRecurrencePreset(recurrence, customMode);
   const editPreset = getRecurrencePreset(editRecurrence, editCustomMode);
   const rootStyle = {
@@ -656,6 +702,7 @@ export function Widget() {
     '--widget-opacity': data.settings.widgetOpacity / 100,
     '--orb-left': expanded ? `${data.placement.orbX}px` : '0px',
     '--orb-top': expanded ? `${data.placement.orbY}px` : '0px',
+    '--panel-top': expanded ? `${data.placement.panelY ?? 0}px` : '0px',
     '--panel-width': `${data.placement.panelWidth}px`,
     '--panel-height': `${data.placement.panelHeight}px`,
     '--window-width': `${data.placement.windowWidth}px`,
@@ -666,16 +713,16 @@ export function Widget() {
     className={`widget-root ${expanded ? 'expanded' : ''} ${expanded && !data.placement.panelRight ? 'panel-on-left' : ''}`}
     style={rootStyle}
     onPointerDown={event => {
-      if (expandedRef.current && event.target === event.currentTarget) void togglePanel();
+      if (expandedRef.current && !pinned && event.target === event.currentTarget) void togglePanel();
     }}
   >
-    <div
+    {!orbHidden && <div
       role="button"
       tabIndex={0}
       className={`orb ${isTimerShowingInOrb ? 'timer-active' : ''}`}
       aria-label={expanded ? 'Close task panel' : 'Open task panel'}
       aria-expanded={expanded}
-      onPointerDown={onPointerDown}
+      onPointerDown={onOrbPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerCancel}
@@ -683,8 +730,8 @@ export function Widget() {
         const bounds = event.currentTarget.getBoundingClientRect();
         const x = (event.clientX - bounds.left) / bounds.width - 0.5;
         const y = (event.clientY - bounds.top) / bounds.height - 0.5;
-        event.currentTarget.style.setProperty('--tilt-x', `${-y * 9}deg`);
-        event.currentTarget.style.setProperty('--tilt-y', `${x * 9}deg`);
+        event.currentTarget.style.setProperty('--tilt-x', `${-y * 6}deg`);
+        event.currentTarget.style.setProperty('--tilt-y', `${x * 6}deg`);
       }}
       onMouseLeave={event => {
         event.currentTarget.style.setProperty('--tilt-x', '0deg');
@@ -698,9 +745,18 @@ export function Widget() {
         }
       }}
     >
-      {data.settings.showProgressRing && <svg viewBox="0 0 100 100" aria-hidden="true">
-        <circle className="orb-track" cx="50" cy="50" r="43" />
-        <circle className="orb-progress" cx="50" cy="50" r="43" style={{ strokeDashoffset: circumference * (1 - orbRatio) }} />
+      {data.settings.showProgressRing && <svg className="orb-ring-svg" viewBox="0 0 100 100" aria-hidden="true">
+        <circle className="orb-track" cx="50" cy="50" r={ringRadius} />
+        <circle
+          className="orb-progress"
+          cx="50"
+          cy="50"
+          r={ringRadius}
+          style={{
+            strokeDasharray: circumference,
+            strokeDashoffset: circumference * (1 - orbRatio)
+          }}
+        />
       </svg>}
       <span className={isTimerShowingInOrb ? (orbHasHours ? 'orb-timer-text compact' : 'orb-timer-text') : ''}>{orbLabel}</span>
       {isTimerShowingInOrb && (
@@ -713,12 +769,12 @@ export function Widget() {
         >
           <button
             type="button"
-            className="orb-mini-btn left"
+            className="orb-mini-btn"
             title="Change timer"
             aria-label="Change timer"
             onClick={() => { void togglePanel(true); }}
           >
-            <SlidersHorizontal size={miniIconSize} />
+            <SlidersHorizontal size={miniIconSize} strokeWidth={2} />
           </button>
           <button
             type="button"
@@ -730,22 +786,29 @@ export function Widget() {
               else void handleResumeActiveTimer();
             }}
           >
-            {timer.running ? <Pause size={miniIconSize} /> : <Play size={miniIconSize} />}
+            {timer.running ? <Pause size={miniIconSize} strokeWidth={2.2} /> : <Play size={miniIconSize} strokeWidth={2.2} />}
           </button>
           <button
             type="button"
-            className="orb-mini-btn right"
+            className="orb-mini-btn"
             title="Reset timer"
             aria-label="Reset timer"
             onClick={() => { void handleResetTimer(); }}
           >
-            <RotateCcw size={miniIconSize} />
+            <RotateCcw size={miniIconSize} strokeWidth={2} />
           </button>
         </div>
       )}
-    </div>
-    {expanded && <section className="widget-panel" aria-label="Task panel"
-      onPointerDownCapture={() => window.orbit.setWidgetTransientInteraction(true)}>
+    </div>}
+    {expanded && <section
+      className={`widget-panel ${pinned ? 'pinned' : ''}`}
+      aria-label="Task panel"
+      onPointerDown={onPanelPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
+      onPointerDownCapture={() => window.orbit.setWidgetTransientInteraction(true)}
+    >
       <header className="widget-head">
         {creatingList ? (
           <form className="new-list-form" onSubmit={submitNewList}>
@@ -828,6 +891,15 @@ export function Widget() {
         )}
         <button type="button" className="add-list-button" aria-label="Create a list" title="Create a list" onClick={startCreateList}>
           <Plus size={15} />
+        </button>
+        <button
+          type="button"
+          className={`pin-header-button ${pinned ? 'active' : ''}`}
+          aria-label={pinned ? 'Unpin panel from screen' : 'Pin panel on screen'}
+          title={pinned ? 'Unpin panel' : 'Pin panel on desktop'}
+          onClick={() => { void togglePinPanel(); }}
+        >
+          {pinned ? <PinOff size={13} /> : <Pin size={13} />}
         </button>
         <button
           type="button"

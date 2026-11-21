@@ -29,7 +29,14 @@
   "build": {
     "appId": "local.orbit.productivity",
     "productName": "Orbit",
+    "directories": {
+      "buildResources": "build"
+    },
     "files": ["out/**/*", "package.json"],
-    "win": { "target": ["portable"] }
+    "win": {
+      "target": ["portable"],
+      "icon": "build/icon.ico",
+      "artifactName": "${productName}.${ext}"
+    }
   }
 }

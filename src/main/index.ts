@@ -66,6 +66,7 @@ let dashboard: BrowserWindow | null = null;
 let expanded = false;
 let panelPinned = false;
 let orbHiddenWhilePinned = false;
+let userHiddenViaShortcut = false;
 let expandedPlacement: WidgetData['placement'] = {
   panelRight: true,
   orbX: 0,
@@ -483,7 +484,7 @@ function getExpandedBounds(circleX: number, circleY: number, size: number): Elec
 function applyWidgetSettings() {
   if (!widget || widget.isDestroyed()) return;
   const pinOnTop = storedData.settings.alwaysOnTop && !storedData.settings.desktopOnly;
-  widget.setAlwaysOnTop(pinOnTop, pinOnTop ? 'floating' : 'normal');
+  widget.setAlwaysOnTop(pinOnTop, pinOnTop ? 'screen-saver' : 'normal');
   const size = widgetSize();
   const [x, y] = widget.getPosition();
   if (expanded) {
@@ -526,7 +527,8 @@ function toggleDesktopOverlayMode() {
 function createWidget() {
   if (widget && !widget.isDestroyed()) {
     if (widget.isMinimized()) widget.restore();
-    widget.show();
+    userHiddenViaShortcut = false;
+    widget.showInactive();
     applyWidgetSettings();
     return;
   }
@@ -534,6 +536,7 @@ function createWidget() {
   const position = storedData.settings.rememberPosition
     ? clampBounds(storedData.settings.widgetX, storedData.settings.widgetY, size, size)
     : clampBounds(100, 120, size, size);
+  const pinOnTop = storedData.settings.alwaysOnTop && !storedData.settings.desktopOnly;
   widget = new BrowserWindow({
     width: size,
     height: size,
@@ -543,7 +546,11 @@ function createWidget() {
     transparent: true,
     resizable: false,
     movable: false,
-    alwaysOnTop: storedData.settings.alwaysOnTop && !storedData.settings.desktopOnly,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    type: 'toolbar',
+    alwaysOnTop: pinOnTop,
     skipTaskbar: true,
     hasShadow: false,
     backgroundColor: '#00000000',
@@ -554,7 +561,25 @@ function createWidget() {
       sandbox: true
     }
   });
+  if (pinOnTop) {
+    widget.setAlwaysOnTop(true, 'screen-saver');
+  }
   loadRenderer(widget, 'widget');
+  widget.on('minimize', () => {
+    if (!userHiddenViaShortcut && widget && !widget.isDestroyed()) {
+      widget.restore();
+      widget.showInactive();
+    }
+  });
+  widget.on('hide', () => {
+    if (!userHiddenViaShortcut && widget && !widget.isDestroyed()) {
+      setTimeout(() => {
+        if (!userHiddenViaShortcut && widget && !widget.isDestroyed() && !widget.isVisible()) {
+          widget.showInactive();
+        }
+      }, 40);
+    }
+  });
   widget.on('blur', () => {
     setTimeout(collapseWidgetOnBlur, 120);
   });
@@ -580,6 +605,7 @@ function createDashboard() {
     title: 'Orbit',
     show: true,
     transparent: false,
+    icon: join(__dirname, '../../build/icon.png'),
     backgroundColor: '#06080b',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -1170,7 +1196,8 @@ if (!hasSingleInstanceLock) app.quit();
 app.on('second-instance', () => {
   if (widget && !widget.isDestroyed()) {
     if (widget.isMinimized()) widget.restore();
-    widget.show();
+    userHiddenViaShortcut = false;
+    widget.showInactive();
     applyWidgetSettings();
   }
 });
@@ -1209,7 +1236,8 @@ app.whenReady().then(() => {
       // When dialogue box is pinned, keep dialogue box visible and only toggle the circle!
       if (expanded && panelPinned) {
         if (!widget.isVisible()) {
-          widget.show();
+          userHiddenViaShortcut = false;
+          widget.showInactive();
           orbHiddenWhilePinned = false;
         } else {
           orbHiddenWhilePinned = !orbHiddenWhilePinned;
@@ -1217,10 +1245,13 @@ app.whenReady().then(() => {
         sendWidgetData();
         return;
       }
-      if (widget.isVisible()) widget.hide();
-      else {
+      if (widget.isVisible()) {
+        userHiddenViaShortcut = true;
+        widget.hide();
+      } else {
+        userHiddenViaShortcut = false;
         orbHiddenWhilePinned = false;
-        widget.show();
+        widget.showInactive();
         applyWidgetSettings();
         sendWidgetData();
       }

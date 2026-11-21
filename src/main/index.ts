@@ -1,4 +1,5 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, Notification, screen } from 'electron';
+import { spawn, ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 import fs from 'node:fs';
 
@@ -67,6 +68,7 @@ let expanded = false;
 let panelPinned = false;
 let orbHiddenWhilePinned = false;
 let userHiddenViaShortcut = false;
+let desktopPinWorker: ChildProcess | null = null;
 let expandedPlacement: WidgetData['placement'] = {
   panelRight: true,
   orbX: 0,
@@ -481,10 +483,99 @@ function getExpandedBounds(circleX: number, circleY: number, size: number): Elec
   return { ...bounds, width: windowWidth, height: windowHeight };
 }
 
+function stopDesktopPinWorker() {
+  if (desktopPinWorker && !desktopPinWorker.killed) {
+    try {
+      desktopPinWorker.kill();
+    } catch {}
+  }
+  desktopPinWorker = null;
+}
+
+function getWidgetHwndDecimal(): string | null {
+  if (!widget || widget.isDestroyed()) return null;
+  const buf = widget.getNativeWindowHandle();
+  if (buf.length >= 8) return buf.readBigUInt64LE(0).toString();
+  if (buf.length >= 4) return String(buf.readUInt32LE(0));
+  return null;
+}
+
+function attachWidgetToWindowsDesktop(enableDesktopPin: boolean) {
+  if (process.platform !== 'win32' || !widget || widget.isDestroyed()) return;
+  const hwnd = getWidgetHwndDecimal();
+  if (!hwnd) return;
+
+  stopDesktopPinWorker();
+
+  const psScript = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class OrbitWin32 {
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr childAfter, string className, string windowTitle);
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  [DllImport("user32.dll")]
+  public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+}
+"@
+
+$target = [IntPtr]::new(${hwnd})
+$SWP_NOSIZE = 0x0001
+$SWP_NOMOVE = 0x0002
+$SWP_NOACTIVATE = 0x0010
+$SWP_FRAMECHANGED = 0x0020
+
+if (${enableDesktopPin ? '$true' : '$false'}) {
+  $progman = [OrbitWin32]::FindWindow("Progman", $null)
+  $res = [UIntPtr]::Zero
+  [OrbitWin32]::SendMessageTimeout($progman, 0x052C, [UIntPtr]::Zero, [IntPtr]::Zero, 0, 1000, [ref]$res) | Out-Null
+
+  $workerw = [IntPtr]::Zero
+  $curr = [IntPtr]::Zero
+  while ($true) {
+    $curr = [OrbitWin32]::FindWindowEx([IntPtr]::Zero, $curr, "WorkerW", $null)
+    if ($curr -eq [IntPtr]::Zero) { break }
+    $defView = [OrbitWin32]::FindWindowEx($curr, [IntPtr]::Zero, "SHELLDLL_DefView", $null)
+    if ($defView -ne [IntPtr]::Zero) {
+      $workerw = [OrbitWin32]::FindWindowEx([IntPtr]::Zero, $curr, "WorkerW", $null)
+      break
+    }
+  }
+
+  $hostHwnd = if ($workerw -ne [IntPtr]::Zero) { $workerw } else { $progman }
+  if ($hostHwnd -ne [IntPtr]::Zero) {
+    [OrbitWin32]::SetParent($target, $hostHwnd) | Out-Null
+    [OrbitWin32]::SetWindowPos($target, [IntPtr]::Zero, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_NOACTIVATE -bor $SWP_FRAMECHANGED) | Out-Null
+  }
+} else {
+  [OrbitWin32]::SetParent($target, [IntPtr]::Zero) | Out-Null
+  [OrbitWin32]::SetWindowPos($target, [IntPtr]::new(-1), 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_NOACTIVATE -bor $SWP_FRAMECHANGED) | Out-Null
+}
+`;
+
+  desktopPinWorker = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
+    { windowsHide: true, stdio: 'ignore' }
+  );
+}
+
 function applyWidgetSettings() {
   if (!widget || widget.isDestroyed()) return;
   const pinOnTop = storedData.settings.alwaysOnTop && !storedData.settings.desktopOnly;
-  widget.setAlwaysOnTop(pinOnTop, pinOnTop ? 'screen-saver' : 'normal');
+  if (pinOnTop) {
+    attachWidgetToWindowsDesktop(false);
+    widget.setAlwaysOnTop(true, 'screen-saver');
+  } else {
+    widget.setAlwaysOnTop(false);
+    attachWidgetToWindowsDesktop(true);
+  }
   const size = widgetSize();
   const [x, y] = widget.getPosition();
   if (expanded) {
@@ -553,6 +644,7 @@ function createWidget() {
     alwaysOnTop: pinOnTop,
     skipTaskbar: true,
     hasShadow: false,
+    icon: join(__dirname, '../../build/icon.png'),
     backgroundColor: '#00000000',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -587,7 +679,10 @@ function createWidget() {
     persistPosition();
     widget = null;
   });
-  widget.webContents.on('did-finish-load', sendWidgetData);
+  widget.webContents.on('did-finish-load', () => {
+    sendWidgetData();
+    applyWidgetSettings();
+  });
 }
 
 function createDashboard() {
@@ -1278,6 +1373,7 @@ app.whenReady().then(() => {
 });
 
 app.on('will-quit', () => {
+  stopDesktopPinWorker();
   try {
     if (storedData) persistData();
   } catch (error) {

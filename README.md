@@ -66,7 +66,7 @@
 ### Installation & Run
 ```bash
 # Clone the repository
-git clone [https://github.com/](https://github.com/)<your-username>/orbit.git
+git clone [https://github.com/](https://github.com/)04priyanshuuuu/orbit.git
 cd orbit
 
 # Install dependencies

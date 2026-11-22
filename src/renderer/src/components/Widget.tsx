@@ -652,11 +652,7 @@ export function Widget() {
   const today = dateKey(now);
   const activeListId = selectedListId ?? 'daily';
   const visibleTasks = selectedListId
-<<<<<<< HEAD
     ? data.tasks.filter(task => task.listId === selectedListId)
-=======
-    ? data.tasks.filter(task => task.listId === selectedListId && isTaskScheduledForDate(task, today))
->>>>>>> ab0261a47eb49002688a3dcfc66479bd4ec1c0a2
     : data.tasks.filter(task => task.listId === 'daily' && isTaskScheduledForDate(task, today));
   const analytics = calculateProductivityAnalytics(data, now, activeListId);
   const orbPercent = calculateListDayProgress(data, now, activeListId).percent;
